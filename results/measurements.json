@@ -1,0 +1,282 @@
+{
+  "recorded": "2026-09-11/12",
+  "method": "One active request. Temperatures are listed per run. Generation rate excludes time before the first text chunk and EOS, and includes final stream cleanup. Recorded results, not latency guarantees.",
+  "h100_short": {
+    "hardware": "4 x H100 80 GB",
+    "context_limit": 4096,
+    "dspark": true,
+    "base_image": "upstream pinned image, no local patches",
+    "runs": [
+      {
+        "workload": "integers_1_to_60",
+        "run": 1,
+        "input_tokens": 25,
+        "output_tokens": 178,
+        "ttft_seconds": 0.16577945399967575,
+        "decode_tokens_per_second": 261.80592636392265,
+        "output_matches": true
+      },
+      {
+        "workload": "integers_1_to_60",
+        "run": 2,
+        "input_tokens": 25,
+        "output_tokens": 178,
+        "ttft_seconds": 0.18345200200019462,
+        "decode_tokens_per_second": 262.036489593625,
+        "output_matches": true
+      },
+      {
+        "workload": "code_intervals",
+        "run": 1,
+        "input_tokens": 90,
+        "output_tokens": 615,
+        "ttft_seconds": 0.17365125099968282,
+        "decode_tokens_per_second": 217.1460262097383,
+        "check": "syntax_and_requested_structure",
+        "check_passed": true
+      },
+      {
+        "workload": "code_intervals",
+        "run": 2,
+        "input_tokens": 90,
+        "output_tokens": 615,
+        "ttft_seconds": 0.17571158800001285,
+        "decode_tokens_per_second": 216.84036958188383,
+        "check": "syntax_and_requested_structure",
+        "check_passed": true
+      },
+      {
+        "workload": "inventory_json",
+        "run": 1,
+        "input_tokens": 74,
+        "output_tokens": 121,
+        "ttft_seconds": 0.1799818609997601,
+        "decode_tokens_per_second": 248.13577248355548,
+        "check": "exact_structured_values",
+        "check_passed": true
+      },
+      {
+        "workload": "inventory_json",
+        "run": 2,
+        "input_tokens": 74,
+        "output_tokens": 121,
+        "ttft_seconds": 0.1774859719998858,
+        "decode_tokens_per_second": 248.70001548605367,
+        "check": "exact_structured_values",
+        "check_passed": true
+      }
+    ],
+    "code_check_note": "Generated interval code passed eight independent contract checks. One of its own generated tests had an incorrect expected value.",
+    "prompts": {
+      "integers_1_to_60": {
+        "text": "Return the integers from 1 through 60 in order, separated by commas. Output only the sequence.",
+        "max_new_tokens": 200
+      },
+      "code_intervals": {
+        "text": "Write a complete Python module containing merge_intervals(intervals). It must return a new sorted list of (start, end) tuples, merge overlapping or touching closed intervals, leave input unchanged, accept unsorted negative and zero-length intervals, and raise ValueError for an interval whose start exceeds its end. Include a short docstring and a unittest.TestCase with at least six test methods. Return Python only, with no Markdown fences.",
+        "max_new_tokens": 1024
+      },
+      "inventory_json": {
+        "text": "Return only a JSON object with keys items and total_quantity. items must contain exactly ten objects in order, with id values SKU-001 through SKU-010 and quantity values equal to the square of the corresponding integer 1 through 10. total_quantity must be the sum of all ten quantities. Include no other keys or text.",
+        "max_new_tokens": 600
+      }
+    }
+  },
+  "h100_long": {
+    "hardware": "4 x H100 80 GB",
+    "context_limit": 1048576,
+    "dspark": false,
+    "comparison_max_visible_keys": 131072,
+    "runs": [
+      {
+        "input_tokens": 8192,
+        "needle_positions": [
+          829,
+          4081,
+          7334
+        ],
+        "expected": {
+          "alpha": "ba55027b414b",
+          "beta": "6e7bd31625fd",
+          "gamma": "87cf82e892fa"
+        },
+        "input_sha256": "1092e33e5cb39c3ab89dfed471f7319cb6d110a32be6032cc4dc020de93555d5",
+        "passed": true,
+        "text": "{\"alpha\": \"ba55027b414b\", \"beta\": \"6e7bd31625fd\", \"gamma\": \"87cf82e892fa\"}",
+        "output_tokens": 34,
+        "total_seconds": 7.352131381001527,
+        "ttft_seconds": 6.434568692002358,
+        "decode_tokens_per_second": 35.96484512245668
+      },
+      {
+        "input_tokens": 32768,
+        "needle_positions": [
+          3286,
+          16371,
+          29453
+        ],
+        "expected": {
+          "alpha": "47f2b3f424a9",
+          "beta": "4974de2563ef",
+          "gamma": "23280af33ab6"
+        },
+        "input_sha256": "c526d2add2abe97f5120aebd286e7fb113a4034813726b260e292b075816ab51",
+        "passed": true,
+        "text": "{\"alpha\": \"47f2b3f424a9\", \"beta\": \"4974de2563ef\", \"gamma\": \"23280af33ab6\"}",
+        "output_tokens": 36,
+        "total_seconds": 28.19760148900241,
+        "ttft_seconds": 27.229597362002096,
+        "decode_tokens_per_second": 36.156870641098706
+      },
+      {
+        "input_tokens": 131072,
+        "needle_positions": [
+          13116,
+          65522,
+          117925
+        ],
+        "expected": {
+          "alpha": "6012c9bc4cf6",
+          "beta": "aa39bb05eb5a",
+          "gamma": "46a9ae3afd78"
+        },
+        "input_sha256": "2e1b1193f1771bcbe63824ffddb4a31cb104aa25556109735b354916edcddb9d",
+        "passed": true,
+        "text": "{\"alpha\": \"6012c9bc4cf6\", \"beta\": \"aa39bb05eb5a\", \"gamma\": \"46a9ae3afd78\"}",
+        "output_tokens": 38,
+        "total_seconds": 130.8551550049997,
+        "ttft_seconds": 129.82979234700178,
+        "decode_tokens_per_second": 36.084793718005365
+      },
+      {
+        "input_tokens": 1048000,
+        "needle_positions": [
+          104809,
+          523985,
+          943161
+        ],
+        "expected": {
+          "alpha": "d3e152864e54",
+          "beta": "d11a6a91e392",
+          "gamma": "f9aa7c31b680"
+        },
+        "input_sha256": "2d311ee47d9af100c788c1f48005a3fa5607c4f9812fce6ea7a4c0e2739b8a9c",
+        "passed": true,
+        "text": "{\"alpha\": \"d3e152864e54\", \"beta\": \"d11a6a91e392\", \"gamma\": \"f9aa7c31b680\"}",
+        "output_tokens": 38,
+        "total_seconds": 3418.966759117,
+        "ttft_seconds": 3416.7821019090006,
+        "decode_tokens_per_second": 16.93629548128634
+      }
+    ],
+    "cached_repeat": {
+      "passed": true,
+      "input_tokens": 1048000,
+      "text": "{\"alpha\": \"d3e152864e54\", \"beta\": \"d11a6a91e392\", \"gamma\": \"f9aa7c31b680\"}",
+      "expected": {
+        "alpha": "d3e152864e54",
+        "beta": "d11a6a91e392",
+        "gamma": "f9aa7c31b680"
+      },
+      "ttft_seconds": 6.164683999493718,
+      "total_seconds": 8.403998624533415,
+      "cached_tokens": 1047808,
+      "timing_scope": "Client-observed; includes network and upload overhead."
+    },
+    "serving_note": "Recorded runs included reference comparisons through 131072 visible keys. Final serving disables comparison-only work; the returned inference path is unchanged."
+  },
+  "a100": {
+    "hardware": "8 x A100 40 GB",
+    "runtime": "Separate adapted reference runtime; not included here.",
+    "context_limit": 4096,
+    "prompt_tokens": 35,
+    "output_tokens": 178,
+    "ttft_seconds": 1.035842686000251,
+    "elapsed_seconds": 13.019965409999713,
+    "decode_tokens_per_second": 14.769541674130133,
+    "passed": true,
+    "logit_comparisons": 36,
+    "all_logits_exact": true,
+    "comparison_reference": "Baseline of the same adapted A100 runtime."
+  },
+  "h100_cached": {
+    "context_length": 409600,
+    "cold_prompt_tokens": 399934,
+    "cold_ttft_seconds": 497.35823306599923,
+    "measurements": [
+      {
+        "turn": "code",
+        "output_tokens": 348,
+        "decode_tokens_per_second": 203.10024351000547,
+        "ttft_seconds": 0.5072038430080283,
+        "cached_tokens": 400640,
+        "temperature": 0,
+        "endpoint": "/generate"
+      },
+      {
+        "turn": "prose",
+        "output_tokens": 212,
+        "decode_tokens_per_second": 114.05879606370411,
+        "ttft_seconds": 0.5989470929926028,
+        "cached_tokens": 400896,
+        "temperature": 0,
+        "endpoint": "/generate"
+      },
+      {
+        "turn": "explanation",
+        "output_tokens": 299,
+        "decode_tokens_per_second": 129.92293250606932,
+        "ttft_seconds": 0.5095439279975835,
+        "cached_tokens": 401664,
+        "temperature": 0.6,
+        "endpoint": "/generate"
+      },
+      {
+        "turn": "creative",
+        "output_tokens": 405,
+        "decode_tokens_per_second": 107.22468544519269,
+        "ttft_seconds": 0.5376241889898665,
+        "cached_tokens": 401920,
+        "temperature": 0.6,
+        "endpoint": "/generate"
+      },
+      {
+        "turn": "counting",
+        "output_tokens": 178,
+        "decode_tokens_per_second": 243.08450905567932,
+        "ttft_seconds": 1.4190238599985605,
+        "cached_tokens": 401152,
+        "temperature": 0,
+        "endpoint": "/v1/chat/completions"
+      },
+      {
+        "turn": "retrieval",
+        "output_tokens": 97,
+        "decode_tokens_per_second": 193.15627324194816,
+        "ttft_seconds": 1.3759425200114492,
+        "cached_tokens": 401408,
+        "temperature": 0,
+        "endpoint": "/v1/chat/completions"
+      }
+    ],
+    "hardware": "4 x H100 80 GB",
+    "dspark": true,
+    "image_input": true,
+    "measurement_date": "2026-09-12",
+    "note": "GPU qualification before parser flags were enabled; identical GPU sources and settings were retained. Last two measurements use Chat Completions; others use /generate. Sampled outputs are nondeterministic.",
+    "varied_prompts": [
+      "Write a complete Python module containing first_unique_char(text). Return the first character occurring exactly once, or None if there is none. Treat uppercase and lowercase as different. Include a short docstring and a unittest.TestCase with at least six tests, covering empty input, repeated characters, spaces, and case sensitivity. Return Python only, without Markdown fences.",
+      "Explain how a cache hit and a cache miss differ, using a library as an analogy. Then explain why a long conversation can still take work to generate its next word even when earlier text is cached. About 200 words, plain prose."
+    ],
+    "sampled_prompts": [
+      "Explain the difference between latency and throughput in an inference server. Include two simple numerical examples, and explain why adding concurrent requests can improve throughput while making each request slower. About 250 words, plain prose.",
+      "Write a scene of about 350 words in which two friends repair an old radio during a power outage. Include natural dialogue, a small disagreement, and an understated ending. Use concrete details and no headings."
+    ],
+    "fixture": {
+      "target_tokens": 400000,
+      "seed": 20660912,
+      "input_tokens": 399934,
+      "input_sha256": "17d6db76c8a88fcba586b3d2c0a488ef267062da997e9109ff114ed768f97c80"
+    }
+  }
+}

@@ -1,0 +1,575 @@
+{
+  "chat_checks": [
+    {
+      "test": "arithmetic",
+      "passed": true,
+      "output": "323",
+      "prompt_tokens": 17
+    },
+    {
+      "test": "word_transform",
+      "passed": true,
+      "output": "desserts",
+      "prompt_tokens": 16
+    },
+    {
+      "test": "code_reasoning",
+      "passed": true,
+      "output": "[1, 9, 25]",
+      "prompt_tokens": 32
+    },
+    {
+      "test": "json_extraction",
+      "passed": true,
+      "output": "{\"name\": \"Mira\", \"count\": 7}",
+      "prompt_tokens": 29
+    },
+    {
+      "test": "reasoning",
+      "passed": true,
+      "output": "23",
+      "prompt_tokens": 27
+    },
+    {
+      "test": "multiturn_recall",
+      "passed": true,
+      "output": "cobalt-7319",
+      "prompt_tokens": 34
+    },
+    {
+      "test": "sparse_context_retrieval",
+      "passed": true,
+      "output": "VXQ-4827-LIME",
+      "prompt_tokens": 1536
+    }
+  ],
+  "sparse_attention_compaction": {
+    "passed": true,
+    "results": [
+      {
+        "main_tokens": 8192,
+        "query_rows": 64,
+        "original_kv_rows": 8576,
+        "compact_kv_rows": 8411,
+        "selected_values_exact": true,
+        "attention_exact": true,
+        "max_error": 0.0
+      },
+      {
+        "main_tokens": 131072,
+        "query_rows": 256,
+        "original_kv_rows": 131456,
+        "compact_kv_rows": 82857,
+        "selected_values_exact": true,
+        "attention_exact": true,
+        "max_error": 0.0
+      },
+      {
+        "main_tokens": 1048576,
+        "query_rows": 256,
+        "original_kv_rows": 1048960,
+        "compact_kv_rows": 122830,
+        "selected_values_exact": true,
+        "attention_exact": true,
+        "max_error": 0.0
+      }
+    ]
+  },
+  "hopper_scorer_raw_values": {
+    "passed": false,
+    "results": [
+      {
+        "rows": 3,
+        "keys": 2048,
+        "page_size": 128,
+        "exact": true,
+        "max_error": 0.0,
+        "topk_exact": true,
+        "warm_fused_ms": 0.08159566641552374
+      },
+      {
+        "rows": 32,
+        "keys": 8192,
+        "page_size": 256,
+        "exact": true,
+        "max_error": 0.0,
+        "topk_exact": true,
+        "warm_fused_ms": 0.08962033340746227
+      },
+      {
+        "rows": 32,
+        "keys": 131072,
+        "page_size": 128,
+        "exact": false,
+        "max_error": 7.62939453125e-06,
+        "topk_exact": true,
+        "warm_fused_ms": 0.9189856670370015
+      },
+      {
+        "rows": 8,
+        "keys": 1048576,
+        "page_size": 256,
+        "exact": true,
+        "max_error": 0.0,
+        "topk_exact": true,
+        "warm_fused_ms": 1.8018796666486498
+      }
+    ]
+  },
+  "selection_checks": {
+    "passed": true,
+    "description": "Candidate masks and visible selected keys were checked against the original Torch path on every checked real-model query through 131072 input tokens, across all four ranks. This is not a claim of universal full-model parity."
+  },
+  "cached_gpu": {
+    "all_full_code_and_prose_text_matches": true,
+    "tested_probability_tokens": 128,
+    "probability_top10_exact": true,
+    "basic_api_checks": 7,
+    "generated_code_tests": 10,
+    "independent_code_cases": 2000,
+    "large_image_tokens": 968
+  },
+  "candidate_scorer": {
+    "passed": true,
+    "results": [
+      {
+        "rows": 1,
+        "length": 2048,
+        "page_size": 128,
+        "exact": true,
+        "topk_exact": true,
+        "source_scores_exact": true,
+        "slot_row_stride": 2048,
+        "native_ms": 0.008754389008692005,
+        "skipped_ms": 0.008705888127060434,
+        "speedup": 1.0055710435194793,
+        "graph_checks": [
+          {
+            "visible": 0,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 1,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 63,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 64,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 65,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 1024,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 2047,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 2048,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 2048,
+            "mask": "empty",
+            "exact": true,
+            "topk_exact": true
+          }
+        ],
+        "passed": true
+      },
+      {
+        "rows": 6,
+        "length": 65536,
+        "page_size": 256,
+        "exact": true,
+        "topk_exact": true,
+        "source_scores_exact": true,
+        "slot_row_stride": 0,
+        "native_ms": 0.095929637864406,
+        "skipped_ms": 0.08840652906507361,
+        "speedup": 1.0850967556230473,
+        "graph_checks": [
+          {
+            "visible": 0,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 1,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 63,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 64,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 65,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 32768,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 65535,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 65536,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 65536,
+            "mask": "empty",
+            "exact": true,
+            "topk_exact": true
+          }
+        ],
+        "passed": true
+      },
+      {
+        "rows": 1,
+        "length": 409920,
+        "page_size": 128,
+        "exact": true,
+        "topk_exact": true,
+        "source_scores_exact": true,
+        "slot_row_stride": 409920,
+        "native_ms": 0.09666142843544986,
+        "skipped_ms": 0.038711230669929146,
+        "speedup": 2.496986708059798,
+        "graph_checks": [
+          {
+            "visible": 0,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 1,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 63,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 64,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 65,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 204960,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 409919,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 409920,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 409920,
+            "mask": "empty",
+            "exact": true,
+            "topk_exact": true
+          }
+        ],
+        "passed": true
+      },
+      {
+        "rows": 6,
+        "length": 409920,
+        "page_size": 256,
+        "exact": true,
+        "topk_exact": true,
+        "source_scores_exact": true,
+        "slot_row_stride": 0,
+        "native_ms": 0.5374055039992026,
+        "skipped_ms": 0.2134092889438018,
+        "speedup": 2.518191718171745,
+        "graph_checks": [
+          {
+            "visible": 0,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 1,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 63,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 64,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 65,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 204960,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 409919,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 409920,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 409920,
+            "mask": "empty",
+            "exact": true,
+            "topk_exact": true
+          }
+        ],
+        "passed": true
+      },
+      {
+        "rows": 6,
+        "length": 1048576,
+        "page_size": 128,
+        "exact": true,
+        "topk_exact": true,
+        "source_scores_exact": true,
+        "slot_row_stride": 0,
+        "native_ms": 1.3525911244479092,
+        "skipped_ms": 0.33891003118085034,
+        "speedup": 3.9910035112715057,
+        "graph_checks": [
+          {
+            "visible": 0,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 1,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 63,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 64,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 65,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 524288,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 1048575,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 1048576,
+            "exact": true,
+            "topk_exact": true
+          },
+          {
+            "visible": 1048576,
+            "mask": "empty",
+            "exact": true,
+            "topk_exact": true
+          }
+        ],
+        "passed": true
+      }
+    ]
+  },
+  "prefill_allocation": {
+    "passed": true,
+    "results": [
+      {
+        "rows": 3,
+        "keys": 65,
+        "source_mask_and_indices_exact": true,
+        "consumer_indices_exact": true,
+        "old_extra_peak_mib": 0.0302734375,
+        "new_extra_peak_mib": 0.0283203125,
+        "passed": true
+      },
+      {
+        "rows": 33,
+        "keys": 2048,
+        "source_mask_and_indices_exact": true,
+        "consumer_indices_exact": true,
+        "old_extra_peak_mib": 1.03466796875,
+        "new_extra_peak_mib": 0.736328125,
+        "passed": true
+      },
+      {
+        "rows": 65,
+        "keys": 131072,
+        "source_mask_and_indices_exact": true,
+        "consumer_indices_exact": true,
+        "old_extra_peak_mib": 70.3955078125,
+        "new_extra_peak_mib": 42.1435546875,
+        "passed": true
+      },
+      {
+        "rows": 256,
+        "keys": 402688,
+        "source_mask_and_indices_exact": true,
+        "consumer_indices_exact": true,
+        "old_extra_peak_mib": 227.423828125,
+        "new_extra_peak_mib": 83.044921875,
+        "passed": true
+      }
+    ]
+  },
+  "dense_tiles": {
+    "cases": 132,
+    "bit_exact_cases": 63,
+    "worst_relative_rms_error": 6.358663085848093e-05,
+    "graph_replay_matches_eager": true,
+    "note": "Native split-K changes FP32 accumulation order. Full-model code/prose comparisons used matching cache states."
+  },
+  "tools": {
+    "passed": true,
+    "short_cases": [
+      {
+        "case": "weather-False-auto",
+        "passed": true
+      },
+      {
+        "case": "weather-False-required",
+        "passed": true
+      },
+      {
+        "case": "weather-False-{'type': 'function', 'function': {'name': 'get_weather'}}",
+        "passed": true
+      },
+      {
+        "case": "weather-True-auto",
+        "passed": true
+      },
+      {
+        "case": "weather-True-required",
+        "passed": true
+      },
+      {
+        "case": "weather-True-{'type': 'function', 'function': {'name': 'get_weather'}}",
+        "passed": true
+      },
+      {
+        "case": "reasoning-tools",
+        "passed": true
+      },
+      {
+        "case": "harness-parallel",
+        "passed": true
+      },
+      {
+        "case": "parallel-tool-result-roundtrip",
+        "passed": true
+      },
+      {
+        "case": "typed-named",
+        "passed": true
+      },
+      {
+        "case": "zero-argument-strict",
+        "passed": true
+      },
+      {
+        "case": "tool-choice-none",
+        "passed": true
+      }
+    ],
+    "parser_chunkings": 916,
+    "remote_streamed_parallel_roundtrip": true,
+    "initial_long_tool_call_tokens": 400520,
+    "cached_long_tool_result_and_image_rerun": "Not completed. Interleaved live traffic led to another full prefill; the benchmark was stopped. No passing claim for that combined rerun.",
+    "schema_note": "A loose zero-argument call added an extra argument. The strict=True schema test passed; named tool choice alone does not enforce arguments."
+  },
+  "vision": [
+    {
+      "input_pixels": [
+        300,
+        150
+      ],
+      "prompt_tokens": 401917,
+      "cached_tokens": 401664,
+      "image_tokens": 202,
+      "passed": true
+    },
+    {
+      "input_pixels": [
+        1920,
+        1080
+      ],
+      "prompt_tokens": 402683,
+      "cached_tokens": 401664,
+      "image_tokens": 968,
+      "passed": true
+    }
+  ],
+  "limits": [
+    "These tests do not establish universal full-model parity or general vision quality.",
+    "An unmatched-cache probability comparison failed; the controlled matched-cache comparison was exact.",
+    "The first high-resolution image/history run exhausted temporary memory. The preallocated mask and broadcast slot-map fixes passed the subsequent 1920x1080 check."
+  ]
+}

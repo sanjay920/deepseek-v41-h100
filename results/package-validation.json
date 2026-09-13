@@ -1,0 +1,40 @@
+{
+  "date": "2026-09-13",
+  "passed": true,
+  "docker_profiles_built": [
+    "cached",
+    "long"
+  ],
+  "verified_patched_files": {
+    "cached": 6,
+    "long": 3
+  },
+  "cached_sources_match_existing_deployment": true,
+  "metadata_download_without_weights": true,
+  "cached_fixture": {
+    "tokens": 399934,
+    "sha256": "17d6db76c8a88fcba586b3d2c0a488ef267062da997e9109ff114ed768f97c80",
+    "matches_recorded": true
+  },
+  "long_fixture": {
+    "tokens": 1048000,
+    "sha256": "2d311ee47d9af100c788c1f48005a3fa5607c4f9812fce6ea7a4c0e2739b8a9c",
+    "matches_recorded": true
+  },
+  "parser_chunkings": 916,
+  "shipped_api_checks": 7,
+  "shipped_tool_checks": 12,
+  "image_size": [
+    1920,
+    1080
+  ],
+  "image_tokens": 968,
+  "api_test_target": "Existing deployment with identical cached-profile GPU files and serving settings; no full-model reload during packaging.",
+  "gpu_primitive_rerun_during_packaging": false,
+  "launcher_argument_checks": [
+    "cached",
+    "long",
+    "short",
+    "mismatched image rejected"
+  ]
+}

@@ -1,0 +1,54 @@
+{
+  "base_image": "lmsysorg/sglang@sha256:4a5d132a06a77c8331e15845f2e925adc788b00105097ad55409afa3f4fa4860",
+  "sglang_commit": "da64c5cbb8cf6bfd39be19da43573fdfd484c43a",
+  "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+  "model_revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+  "profiles": {
+    "cached": {
+      "patch": "patches/cached.patch",
+      "files": {
+        "python/sglang/srt/layers/attention/deepseek_v4_backend.py": {
+          "before": "486900ed693af0573a941d6b6656ebc01ccb7ff1c44584e43ad3c0fb00a3c3a9",
+          "after": "4ed0020c6d2ce74e4c27ea42ad07c41d01602eeb66353771e2be0d275d55f597"
+        },
+        "python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py": {
+          "before": "b56eca87c3706edc9dd4db0f64431b87d52864495765bc3a85af6dbde21e2a5a",
+          "after": "443595291ecf358116823e73cbbf2c088afbcd06339c0f0db645db4281bea119"
+        },
+        "python/sglang/srt/layers/attention/dsv4/compact_prefill_gather.py": {
+          "before": null,
+          "after": "055abbf7534d4a1429e59ee4a74ddf9d121367b6a95080f52721e26dd885aeb8"
+        },
+        "python/sglang/srt/layers/communicator.py": {
+          "before": "4e1031ead6eac25d6e78a64cc08db6be10a3f707a26417415621582d0abb1c9f",
+          "after": "b48aabaac55b128184dbecdb7d179091acb17b12938411724d1cbfde5a311d6c"
+        },
+        "python/sglang/kernels/ops/quantization/fp8_kernel.py": {
+          "before": "44ff20a04b083012bf2d4914ec1b7277f80dca764b028e5fae2063aeb4cefe09",
+          "after": "f339e23ff80a44041dcf07e35609abf8fc2fce0bf7baa74071420451786d5b03"
+        },
+        "python/sglang/kernels/ops/attention/dsv4/sm90_fp4_indexer.py": {
+          "before": "c00b3b1f3c8d8d8cf151d5329a72e5d404634d8116ca7c9356f1c12af694f0ff",
+          "after": "700d990a84ccbaab0e95a683c120040b1506e21d2928306ea758d81864894530"
+        }
+      }
+    },
+    "long": {
+      "patch": "patches/long.patch",
+      "files": {
+        "python/sglang/srt/layers/attention/deepseek_v4_backend.py": {
+          "before": "486900ed693af0573a941d6b6656ebc01ccb7ff1c44584e43ad3c0fb00a3c3a9",
+          "after": "874f9a998b5091cdc939b7c84cd0b728f3808faca2393f008b00f08df2684563"
+        },
+        "python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py": {
+          "before": "b56eca87c3706edc9dd4db0f64431b87d52864495765bc3a85af6dbde21e2a5a",
+          "after": "443595291ecf358116823e73cbbf2c088afbcd06339c0f0db645db4281bea119"
+        },
+        "python/sglang/srt/layers/attention/dsv4/compact_prefill_gather.py": {
+          "before": null,
+          "after": "055abbf7534d4a1429e59ee4a74ddf9d121367b6a95080f52721e26dd885aeb8"
+        }
+      }
+    }
+  }
+}

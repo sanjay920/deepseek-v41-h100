@@ -1,0 +1,404 @@
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -2,6 +2,7 @@
+ 
+ import enum
+ import functools
++import os
+ import logging
+ from dataclasses import dataclass, field
+ from typing import (
+@@ -76,6 +77,7 @@
+     copy_metadata,
+     maybe_copy_inplace,
+ )
++from sglang.srt.layers.attention.dsv4.compact_prefill_gather import compact_prefill_gather
+ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+     SparsePrefillChunkCache,
+     SparsePrefillWorkspace,
+@@ -328,7 +330,10 @@
+ 
+ 
+ # Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
+-_TORCH_INDEXER_SCORE_BUDGET_BYTES = 1 << 30
++# Four-H100 long-context experiment: retain the existing row batching,
++# but cap each BF16 score tensor at 32 MiB instead of 1 GiB.
++_TORCH_INDEXER_SCORE_BUDGET_BYTES = 1 << 25
++_DSV41_PREFILL_SHADOW_MAX_KEYS = int(os.environ.get("DSV41_PREFILL_SHADOW_MAX_KEYS", "0"))
+ 
+ 
+ def _mask_topk_scores(
+@@ -3501,8 +3506,13 @@
+         )
+         slots = slots.masked_fill(~valid, 0)
+         table = pool.get_index_k_with_scale_buffer(layer.layer_id)
++        candidate_mask = None
++        if indexer.uses_candidates and not indexer.is_candidate_source:
++            assert torch.is_tensor(self.candidate_masks) and self.candidate_masks.shape[0] == bs
++            candidate_mask = self.candidate_masks[:, :lmax]
+         s = fp4_index_logits_decode(
+-            q, weights, slots, lens, table, table.shape[1] // 68
++            q, weights, slots, lens, table, table.shape[1] // 68,
++            candidate_mask=candidate_mask,
+         )
+         if indexer.is_candidate_source:
+             self.candidate_masks = select_candidate_blocks(
+@@ -3548,6 +3558,9 @@
+         compress_lens = (pos + 1) // ratio
+         topk = indexer.index_topk
+         publish = [] if indexer.is_candidate_source else None
++        if indexer.is_candidate_source:
++            # This layer replaces the prior step's mask before any consumer reads it.
++            self.candidate_masks = None
+         consume = self.candidate_masks if indexer.uses_candidates else None
+         for b, r in enumerate(torch.unique_consecutive(req).tolist()):
+             tok = (req == r).nonzero().squeeze(1)
+@@ -3564,44 +3577,87 @@
+             slots_j = self.req_to_token[r, j * ratio].to(torch.int64) // ratio
+             # Dequantize only this request's visible K rows; the full table is
+             # pool-sized.
+-            index_k = pool.get_low_ratio_index_k_dequant(layer.layer_id, slots_j)
++            # The installed Hopper scorer reads the same packed rows directly.
++            # Keep the original dequantized values only for qualification checks.
++            shadow = lc <= _DSV41_PREFILL_SHADOW_MAX_KEYS
++            index_k = None
++            if shadow:
++                index_k = torch.cat([
++                    pool.get_low_ratio_index_k_dequant(layer.layer_id, part)
++                    for part in slots_j.split(32768)
++                ])
++            index_table = pool.get_index_k_with_scale_buffer(layer.layer_id)
+             k = min(topk, lc)
+             # Every step below is per query row; chunk rows so the [rows, heads, lc]
+             # bf16 scores stay under the budget (16 GiB at once for a 16k-token prompt).
+-            rows_per_chunk = max(
+-                1,
+-                _TORCH_INDEXER_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2),
+-            )
+-            masks = [] if publish is not None else None
++            # Budget FP32 output scores; no [rows,heads,keys] intermediate.
++            rows_per_chunk = min(32, max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (lc * 4)))
++            masks = (
++                torch.empty((tok.numel(), lc), dtype=torch.bool, device=pos.device)
++                if publish is not None else None
++            )
+             for start in range(0, tok.numel(), rows_per_chunk):
+                 rows = slice(start, start + rows_per_chunk)
+                 tok_c, lens_c = tok[rows], lens[rows]
+-                s = indexer.scores(q[tok_c], index_k, weights[tok_c])
++                s = fp4_index_logits_decode(
++                    q[tok_c], weights[tok_c],
++                    slots_j.expand(tok_c.numel(), -1), lens_c,
++                    index_table, index_table.shape[1] // 68,
++                )
+                 s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
++                reference_s = None
++                if shadow:
++                    oracle_rows = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2))
++                    reference_s = torch.cat([
++                        indexer.scores(q[part], index_k, weights[part])
++                        for part in tok_c.split(oracle_rows)
++                    ])
++                    reference_s.masked_fill_(j[None, :] >= lens_c[:, None], -torch.inf)
+                 if masks is not None:
+-                    masks.append(
+-                        select_candidate_blocks(
+-                            s,
+-                            lens_c[:, None],
++                    mask_chunk = select_candidate_blocks(
++                        s,
++                        lens_c[:, None],
++                        topk_blocks=indexer.candidate_topk_blocks,
++                        block_size=indexer.candidate_block_size,
++                    )
++                    masks[rows].copy_(mask_chunk)
++                    if shadow:
++                        reference_mask = select_candidate_blocks(
++                            reference_s, lens_c[:, None],
+                             topk_blocks=indexer.candidate_topk_blocks,
+                             block_size=indexer.candidate_block_size,
+                         )
+-                    )
++                        if not torch.equal(mask_chunk, reference_mask):
++                            raise RuntimeError(f"DSV41 prefill candidate-mask mismatch: layer={layer.layer_id}, keys={lc}")
+                 elif consume is not None:
+                     s = s.masked_fill(~consume[b][rows], -torch.inf)
++                    if shadow:
++                        reference_s.masked_fill_(~consume[b][rows], -torch.inf)
+                 idx = s.topk(k, dim=-1, sorted=False).indices
+                 if consume is not None and masks is None:
+                     idx = _mask_topk_scores(s, idx)
+                     idx = idx.masked_fill(idx < 0, lc)
+                 idx = idx.sort(dim=-1).values
+                 reach = idx < lens_c[:, None]
++                if shadow:
++                    reference_idx = reference_s.topk(k, dim=-1, sorted=False).indices
++                    if consume is not None and masks is None:
++                        reference_idx = _mask_topk_scores(reference_s, reference_idx)
++                        reference_idx = reference_idx.masked_fill(reference_idx < 0, lc)
++                    reference_idx = reference_idx.sort(dim=-1).values
++                    actual_visible = torch.where(reach, idx, -1)
++                    reference_visible = torch.where(reference_idx < lens_c[:, None], reference_idx, -1)
++                    if not torch.equal(actual_visible, reference_visible):
++                        raise RuntimeError(f"DSV41 prefill selected-key mismatch: layer={layer.layer_id}, keys={lc}")
+                 page_indices[tok_c, :k] = torch.where(
+                     reach, slots_j[idx.clamp_max(lc - 1)], -1
+                 ).to(torch.int32)
+                 if raw_indices is not None:
+                     raw_indices[tok_c, :k] = torch.where(reach, idx, -1).to(torch.int32)
++            if shadow and lc >= 8192 and lc & (lc - 1) == 0:
++                logger.info(f"DSV41 prefill decisions exact: layer={layer.layer_id}, keys={lc}, queries={tok.numel()}")
+             if masks is not None:
+-                publish.append(torch.cat(masks) if len(masks) > 1 else masks[0])
++                publish.append(masks)
+         if publish is not None:
+             self.candidate_masks = publish
+ 
+@@ -3883,6 +3939,7 @@
+         extra_k_cache = None
+         extra_page_size = None
+         flat_token_ids = None
++        selected_swa_ids = cache.swa_token_ids
+         if compress_ratio == 0:
+             workspace = self.sparse_prefill_workspace.get(cache.swa_token_ids.shape[0])
+             combined_indices = cache.c0_combined_indices
+@@ -3911,9 +3968,13 @@
+                 combined_indices, combined_lens = cache.combine_compressed(
+                     compress_ratio, raw_indices[: cache.num_qo_tokens]
+                 )
++            if compress_ratio in (1, 2):
++                flat_token_ids, selected_swa_ids, combined_indices = compact_prefill_gather(
++                    flat_token_ids, cache.swa_token_ids, combined_indices
++                )
+             n_compressed = flat_token_ids.shape[0]
+             workspace = self.sparse_prefill_workspace.get(
+-                n_compressed + cache.swa_token_ids.shape[0]
++                n_compressed + selected_swa_ids.shape[0]
+             )
+             compressed_slice = workspace[:n_compressed]
+             swa_slice = workspace[n_compressed:]
+@@ -3927,7 +3988,7 @@
+             )
+         dequantize_k_cache_paged(
+             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+-            cache.swa_token_ids,
++            selected_swa_ids,
+             page_size=cache.swa_page_size,
+             out=swa_slice,
+         )
+--- a/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py
++++ b/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py
+@@ -283,5 +283,9 @@
+         """q [t, H, d], k [n, d], weights [t, H] -> [t, n], summed over all heads;
+         bf16 up to the reduction, as the reference does."""
+         s = torch.einsum("bhd,nd->bhn", q, k)
+-        s = (s.relu() * weights.unsqueeze(-1)).sum(dim=1)
++        # Inference-only private score tensor; preserve BF16 rounding while
++        # avoiding two additional score-sized allocations.
++        s.relu_()
++        s.mul_(weights.unsqueeze(-1))
++        s = s.sum(dim=1)
+         return s.float()
+--- a/python/sglang/srt/layers/attention/dsv4/compact_prefill_gather.py
++++ b/python/sglang/srt/layers/attention/dsv4/compact_prefill_gather.py
+@@ -0,0 +1,17 @@
++"""Compact the storage backing sparse prefill without changing key order."""
++import torch
++
++
++def compact_prefill_gather(compressed_ids, swa_ids, indices):
++    count = compressed_ids.numel()
++    if count == 0:
++        return compressed_ids, swa_ids, indices
++    unique, inverse = torch.unique(indices.reshape(-1), sorted=True, return_inverse=True)
++    # Negative indices retain an unused dummy entry in the compact store.
++    # Sorted unique indices put compressed entries before SWA entries, matching
++    # the order in which the caller fills the compact workspace.
++    compressed_columns = unique[unique < count].clamp_min(0).long()
++    swa_columns = (unique[unique >= count] - count).long()
++    remapped = inverse.reshape(indices.shape).to(indices.dtype)
++    remapped = torch.where(indices >= 0, remapped, indices)
++    return compressed_ids[compressed_columns], swa_ids[swa_columns], remapped
+--- a/python/sglang/srt/layers/communicator.py
++++ b/python/sglang/srt/layers/communicator.py
+@@ -185,7 +185,8 @@
+ 
+ # TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
+ # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
+-FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
++# This task uses 256-token prefill chunks and one decoding request.
++FUSE_ALLREDUCE_MAX_BATCH_SIZE = 256
+ 
+ 
+ def apply_flashinfer_allreduce_fusion(batch_size: int):
+--- a/python/sglang/kernels/ops/quantization/fp8_kernel.py
++++ b/python/sglang/kernels/ops/quantization/fp8_kernel.py
+@@ -1661,6 +1661,11 @@
+     return C
+ 
+ 
++# Measured Hopper tiles; native weights and activation quantization are unchanged.
++# Split-K changes FP32 summation order; see the qualification receipt.
++_DSV41_SMALL_DENSE_CONFIGS = {'512,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 16, 'SWAP_AB': False}, '1152,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 16, 'SWAP_AB': False}, '1280,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 16, 'SWAP_AB': False}, '1536,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 16, 'SWAP_AB': False}, '1792,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 16, 'SWAP_AB': False}, '4096,1280': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 8, 'SWAP_AB': False}, '5120,576': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 4, 'SWAP_AB': False}, '5120,2048': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 8, 'SWAP_AB': False}, '5120,15360': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 8, 'SWAP_AB': False}, '8192,1280': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 4, 'SWAP_AB': False}, '25600,6144': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 4, 'SWAP_AB': False}}
++
++
+ def w8a8_block_fp8_matmul_triton(
+     A: torch.Tensor,
+     B: torch.Tensor,
+@@ -1706,6 +1711,9 @@
+             "num_warps": 4,
+             "num_stages": 3,
+         }
++
++    if get_platform().is_sm90 and 0 < M <= 6 and (block_n, block_k) == (32, 32):
++        config = _DSV41_SMALL_DENSE_CONFIGS.get(f"{N},{K}", config)
+ 
+     if _is_gfx1250:
+         config = {**config, "num_stages": 1}
+--- a/python/sglang/kernels/ops/attention/dsv4/sm90_fp4_indexer.py
++++ b/python/sglang/kernels/ops/attention/dsv4/sm90_fp4_indexer.py
+@@ -45,6 +45,7 @@
+     stride_qb,
+     stride_qh,
+     stride_wb,
++    stride_slots_b,
+     H: tl.constexpr,
+     HALF_D: tl.constexpr,  # D // 2 == 64 nibble-pairs per row
+     BLOCK_L: tl.constexpr,
+@@ -59,7 +60,7 @@
+ 
+     n_vis = tl.load(lens_ptr + b)
+     valid = offs_l < tl.minimum(n_vis, L)
+-    slot = tl.load(slots_ptr + b * L + offs_l, mask=offs_l < L, other=0).to(tl.int64)
++    slot = tl.load(slots_ptr + b * stride_slots_b + offs_l, mask=offs_l < L, other=0).to(tl.int64)
+     page = slot // page_size
+     off = slot % page_size
+     row_base = page * row_stride
+@@ -124,7 +125,9 @@
+     assert table.dtype == torch.uint8 and table.dim() == 2
+     q = q.contiguous()
+     weights = weights.to(torch.bfloat16).contiguous()
+-    slots = slots.contiguous()
++    # Prefill shares one physical slot row across queries (row stride zero).
++    if slots.stride(1) != 1:
++        slots = slots.contiguous()
+     out = torch.empty((B, L), dtype=torch.float32, device=q.device)
+     if L == 0:
+         return out
+@@ -143,9 +146,116 @@
+         q.stride(0),
+         q.stride(1),
+         weights.stride(0),
++        slots.stride(0),
+         H=H,
+         HALF_D=INDEX_HEAD_DIM // 2,
+         BLOCK_L=BLOCK_L,
+         num_warps=4,
+     )
+     return out
++
++
++@triton.jit
++def _fp4_index_logits_candidates_kernel(
++    q_ptr,  # [B, H, D] bf16, fq4 queries (already rope'd)
++    w_ptr,  # [B, H] bf16 head weights (softmax scale folded in)
++    slots_ptr,  # [B, L] int64 pool slots per (request, compressed position)
++    lens_ptr,  # [B] int64 visible compressed positions per request
++    table_ptr,  # [num_pages, page_size * 64 + page_size * 4] uint8
++    out_ptr,  # [B, L] fp32 logits, -inf beyond lens
++    L,
++    page_size,
++    row_stride,
++    stride_qb,
++    stride_qh,
++    stride_wb,
++    mask_ptr,
++    stride_mask_b,
++    H: tl.constexpr,
++    HALF_D: tl.constexpr,  # D // 2 == 64 nibble-pairs per row
++    BLOCK_L: tl.constexpr,
++):
++    b = tl.program_id(0)
++    lb = tl.program_id(1)
++    offs_l = lb * BLOCK_L + tl.arange(0, BLOCK_L)
++    offs_h = tl.arange(0, H)
++    offs_i = tl.arange(
++        0, HALF_D
++    )  # byte index i holds elements 2i (low nibble), 2i+1 (high nibble)
++
++    n_vis = tl.load(lens_ptr + b)
++    valid = offs_l < tl.minimum(n_vis, L)
++    candidate = tl.load(mask_ptr + b * stride_mask_b + offs_l, mask=offs_l < L, other=0)
++    active = tl.sum((candidate & valid).to(tl.int32), axis=0) > 0
++    if active:
++        slot = tl.load(slots_ptr + b * L + offs_l, mask=offs_l < L, other=0).to(tl.int64)
++        page = slot // page_size
++        off = slot % page_size
++        row_base = page * row_stride
++    
++        # K payload: [BLOCK_L, HALF_D] uint8
++        pay = tl.load(
++            table_ptr + row_base[:, None] + off[:, None] * PAYLOAD_BYTES + offs_i[None, :],
++            mask=valid[:, None],
++            other=0,
++        )
++        low = _e2m1_decode(pay & 0x0F)
++        high = _e2m1_decode((pay >> 4) & 0x0F)
++        # e8m0 block scales: element j uses block j // 32 -> byte i uses block i // 16.
++        sc_idx = offs_i // 16
++        exps = tl.load(
++            table_ptr
++            + row_base[:, None]
++            + page_size * PAYLOAD_BYTES
++            + off[:, None] * SCALE_BYTES
++            + sc_idx[None, :],
++            mask=valid[:, None],
++            other=127,
++        )
++        scale = tl.exp2(exps.to(tl.float32) - 127.0)
++        k_low = (low * scale).to(tl.bfloat16)  # [BLOCK_L, HALF_D] elements 2i
++        k_high = (high * scale).to(tl.bfloat16)  # elements 2i+1
++    
++        # queries: even / odd elements, [H, HALF_D] bf16
++        q_even = tl.load(
++            q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :]
++        )
++        q_odd = tl.load(
++            q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :] + 1
++        )
++    
++        acc = tl.dot(q_even, tl.trans(k_low))  # [H, BLOCK_L] fp32
++        acc += tl.dot(q_odd, tl.trans(k_high))
++        # reference rounding points: bf16 dot -> relu -> * bf16 weight -> bf16 -> sum -> bf16
++        s = acc.to(tl.bfloat16).to(tl.float32)
++        s = tl.maximum(s, 0.0)
++        w = tl.load(w_ptr + b * stride_wb + offs_h).to(tl.float32)
++        s = (s * w[:, None]).to(tl.bfloat16).to(tl.float32)
++        logit = tl.sum(s, axis=0).to(tl.bfloat16).to(tl.float32)
++        logit = tl.where(valid, logit, float("-inf"))
++    else:
++        logit = tl.full((BLOCK_L,), float("-inf"), tl.float32)
++    tl.store(out_ptr + b * L + offs_l, logit, mask=offs_l < L)
++
++
++_fp4_index_logits_decode_unmasked = fp4_index_logits_decode
++
++
++def fp4_index_logits_decode(q, weights, slots, lens, table, page_size, candidate_mask=None):
++    # Keep the ordinary scorer for source layers, prefill, and short contexts.
++    if candidate_mask is None or slots.shape[1] < 65536:
++        return _fp4_index_logits_decode_unmasked(q, weights, slots, lens, table, page_size)
++    b, h, _ = q.shape
++    length = slots.shape[1]
++    assert candidate_mask.shape == (b, length) and candidate_mask.dtype == torch.bool
++    q = q.contiguous()
++    weights = weights.to(torch.bfloat16).contiguous()
++    slots = slots.contiguous()
++    candidate_mask = candidate_mask.contiguous()
++    out = torch.empty((b, length), dtype=torch.float32, device=q.device)
++    _fp4_index_logits_candidates_kernel[(b, triton.cdiv(length, 64))](
++        q, weights, slots, lens.to(torch.int64).contiguous(), table, out,
++        length, page_size, table.stride(0), q.stride(0), q.stride(1), weights.stride(0),
++        candidate_mask, candidate_mask.stride(0), H=h, HALF_D=64, BLOCK_L=64, num_warps=4,
++    )
++    return out

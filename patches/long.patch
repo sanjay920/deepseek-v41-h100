@@ -1,0 +1,183 @@
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -2,6 +2,7 @@
+ 
+ import enum
+ import functools
++import os
+ import logging
+ from dataclasses import dataclass, field
+ from typing import (
+@@ -76,6 +77,7 @@
+     copy_metadata,
+     maybe_copy_inplace,
+ )
++from sglang.srt.layers.attention.dsv4.compact_prefill_gather import compact_prefill_gather
+ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+     SparsePrefillChunkCache,
+     SparsePrefillWorkspace,
+@@ -328,7 +330,10 @@
+ 
+ 
+ # Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
+-_TORCH_INDEXER_SCORE_BUDGET_BYTES = 1 << 30
++# Four-H100 long-context experiment: retain the existing row batching,
++# but cap each BF16 score tensor at 32 MiB instead of 1 GiB.
++_TORCH_INDEXER_SCORE_BUDGET_BYTES = 1 << 25
++_DSV41_PREFILL_SHADOW_MAX_KEYS = int(os.environ.get("DSV41_PREFILL_SHADOW_MAX_KEYS", "0"))
+ 
+ 
+ def _mask_topk_scores(
+@@ -3564,20 +3569,39 @@
+             slots_j = self.req_to_token[r, j * ratio].to(torch.int64) // ratio
+             # Dequantize only this request's visible K rows; the full table is
+             # pool-sized.
+-            index_k = pool.get_low_ratio_index_k_dequant(layer.layer_id, slots_j)
++            # The installed Hopper scorer reads the same packed rows directly.
++            # Keep the original dequantized values only for qualification checks.
++            shadow = lc <= _DSV41_PREFILL_SHADOW_MAX_KEYS
++            index_k = None
++            if shadow:
++                index_k = torch.cat([
++                    pool.get_low_ratio_index_k_dequant(layer.layer_id, part)
++                    for part in slots_j.split(32768)
++                ])
++            index_table = pool.get_index_k_with_scale_buffer(layer.layer_id)
+             k = min(topk, lc)
+             # Every step below is per query row; chunk rows so the [rows, heads, lc]
+             # bf16 scores stay under the budget (16 GiB at once for a 16k-token prompt).
+-            rows_per_chunk = max(
+-                1,
+-                _TORCH_INDEXER_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2),
+-            )
++            # Budget FP32 output scores; no [rows,heads,keys] intermediate.
++            rows_per_chunk = min(32, max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (lc * 4)))
+             masks = [] if publish is not None else None
+             for start in range(0, tok.numel(), rows_per_chunk):
+                 rows = slice(start, start + rows_per_chunk)
+                 tok_c, lens_c = tok[rows], lens[rows]
+-                s = indexer.scores(q[tok_c], index_k, weights[tok_c])
++                s = fp4_index_logits_decode(
++                    q[tok_c], weights[tok_c],
++                    slots_j.expand(tok_c.numel(), -1), lens_c,
++                    index_table, index_table.shape[1] // 68,
++                )
+                 s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
++                reference_s = None
++                if shadow:
++                    oracle_rows = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2))
++                    reference_s = torch.cat([
++                        indexer.scores(q[part], index_k, weights[part])
++                        for part in tok_c.split(oracle_rows)
++                    ])
++                    reference_s.masked_fill_(j[None, :] >= lens_c[:, None], -torch.inf)
+                 if masks is not None:
+                     masks.append(
+                         select_candidate_blocks(
+@@ -3587,19 +3611,41 @@
+                             block_size=indexer.candidate_block_size,
+                         )
+                     )
++                    if shadow:
++                        reference_mask = select_candidate_blocks(
++                            reference_s, lens_c[:, None],
++                            topk_blocks=indexer.candidate_topk_blocks,
++                            block_size=indexer.candidate_block_size,
++                        )
++                        if not torch.equal(masks[-1], reference_mask):
++                            raise RuntimeError(f"DSV41 prefill candidate-mask mismatch: layer={layer.layer_id}, keys={lc}")
+                 elif consume is not None:
+                     s = s.masked_fill(~consume[b][rows], -torch.inf)
++                    if shadow:
++                        reference_s.masked_fill_(~consume[b][rows], -torch.inf)
+                 idx = s.topk(k, dim=-1, sorted=False).indices
+                 if consume is not None and masks is None:
+                     idx = _mask_topk_scores(s, idx)
+                     idx = idx.masked_fill(idx < 0, lc)
+                 idx = idx.sort(dim=-1).values
+                 reach = idx < lens_c[:, None]
++                if shadow:
++                    reference_idx = reference_s.topk(k, dim=-1, sorted=False).indices
++                    if consume is not None and masks is None:
++                        reference_idx = _mask_topk_scores(reference_s, reference_idx)
++                        reference_idx = reference_idx.masked_fill(reference_idx < 0, lc)
++                    reference_idx = reference_idx.sort(dim=-1).values
++                    actual_visible = torch.where(reach, idx, -1)
++                    reference_visible = torch.where(reference_idx < lens_c[:, None], reference_idx, -1)
++                    if not torch.equal(actual_visible, reference_visible):
++                        raise RuntimeError(f"DSV41 prefill selected-key mismatch: layer={layer.layer_id}, keys={lc}")
+                 page_indices[tok_c, :k] = torch.where(
+                     reach, slots_j[idx.clamp_max(lc - 1)], -1
+                 ).to(torch.int32)
+                 if raw_indices is not None:
+                     raw_indices[tok_c, :k] = torch.where(reach, idx, -1).to(torch.int32)
++            if shadow and lc >= 8192 and lc & (lc - 1) == 0:
++                logger.info(f"DSV41 prefill decisions exact: layer={layer.layer_id}, keys={lc}, queries={tok.numel()}")
+             if masks is not None:
+                 publish.append(torch.cat(masks) if len(masks) > 1 else masks[0])
+         if publish is not None:
+@@ -3883,6 +3929,7 @@
+         extra_k_cache = None
+         extra_page_size = None
+         flat_token_ids = None
++        selected_swa_ids = cache.swa_token_ids
+         if compress_ratio == 0:
+             workspace = self.sparse_prefill_workspace.get(cache.swa_token_ids.shape[0])
+             combined_indices = cache.c0_combined_indices
+@@ -3911,9 +3958,13 @@
+                 combined_indices, combined_lens = cache.combine_compressed(
+                     compress_ratio, raw_indices[: cache.num_qo_tokens]
+                 )
++            if compress_ratio in (1, 2):
++                flat_token_ids, selected_swa_ids, combined_indices = compact_prefill_gather(
++                    flat_token_ids, cache.swa_token_ids, combined_indices
++                )
+             n_compressed = flat_token_ids.shape[0]
+             workspace = self.sparse_prefill_workspace.get(
+-                n_compressed + cache.swa_token_ids.shape[0]
++                n_compressed + selected_swa_ids.shape[0]
+             )
+             compressed_slice = workspace[:n_compressed]
+             swa_slice = workspace[n_compressed:]
+@@ -3927,7 +3978,7 @@
+             )
+         dequantize_k_cache_paged(
+             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+-            cache.swa_token_ids,
++            selected_swa_ids,
+             page_size=cache.swa_page_size,
+             out=swa_slice,
+         )
+--- a/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py
++++ b/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py
+@@ -283,5 +283,9 @@
+         """q [t, H, d], k [n, d], weights [t, H] -> [t, n], summed over all heads;
+         bf16 up to the reduction, as the reference does."""
+         s = torch.einsum("bhd,nd->bhn", q, k)
+-        s = (s.relu() * weights.unsqueeze(-1)).sum(dim=1)
++        # Inference-only private score tensor; preserve BF16 rounding while
++        # avoiding two additional score-sized allocations.
++        s.relu_()
++        s.mul_(weights.unsqueeze(-1))
++        s = s.sum(dim=1)
+         return s.float()
+--- /dev/null
++++ b/python/sglang/srt/layers/attention/dsv4/compact_prefill_gather.py
+@@ -0,0 +1,17 @@
++"""Compact the storage backing sparse prefill without changing key order."""
++import torch
++
++
++def compact_prefill_gather(compressed_ids, swa_ids, indices):
++    count = compressed_ids.numel()
++    if count == 0:
++        return compressed_ids, swa_ids, indices
++    unique, inverse = torch.unique(indices.reshape(-1), sorted=True, return_inverse=True)
++    # Negative indices retain an unused dummy entry in the compact store.
++    # Sorted unique indices put compressed entries before SWA entries, matching
++    # the order in which the caller fills the compact workspace.
++    compressed_columns = unique[unique < count].clamp_min(0).long()
++    swa_columns = (unique[unique >= count] - count).long()
++    remapped = inverse.reshape(indices.shape).to(indices.dtype)
++    remapped = torch.where(indices >= 0, remapped, indices)
++    return compressed_ids[compressed_columns], swa_ids[swa_columns], remapped

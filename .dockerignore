@@ -1,0 +1,13 @@
+**
+!Dockerfile
+!apply.py
+!download.py
+!versions.json
+!LICENSE
+!NOTICE
+!patches/
+!patches/**
+!tests/
+!tests/**
+**/__pycache__
+**/*.pyc

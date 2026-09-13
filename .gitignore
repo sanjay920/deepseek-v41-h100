@@ -1,0 +1,15 @@
+weights/
+.cache/
+runs/
+.venv/
+__pycache__/
+*.pyc
+*.safetensors
+*.gguf
+*.pt
+*.log
+.env*
+*.pem
+*.key
+.DS_Store
+upstream/

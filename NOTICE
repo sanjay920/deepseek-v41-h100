@@ -1,0 +1,11 @@
+Patches are based on SGLang, licensed under Apache-2.0:
+https://github.com/sgl-project/sglang
+Commit: da64c5cbb8cf6bfd39be19da43573fdfd484c43a
+
+The base container and its dependencies retain their upstream licenses.
+
+The model and reference message encoder are downloaded separately from
+deepseek-ai/DeepSeek-V4.1-Flash at the revision in versions.json. Their
+upstream license is MIT and is included with that download.
+
+Recorded retrieval inputs and passcodes are synthetic.
