@@ -13,16 +13,17 @@ or rerun the GPU primitive benchmarks.
 
 ## Checks without loading weights
 
-The Docker build checks upstream hashes, applies the selected patch with zero
-fuzz, then verifies the resulting files against the tested hashes.
+The Docker build checks the original files, applies the selected patch without
+adjusting mismatched lines, and checks that the result matches the tested code.
 
 ```bash
 docker run --rm deepseek-v41-h100:cached python3 /opt/experiment/apply.py --check
 docker run --rm deepseek-v41-h100:cached python3 /opt/experiment/tests/tool_parser.py
 ```
 
-The parser check covers 916 stream chunkings, including parallel calls, typed
-arguments, JSON bodies, and zero-argument calls.
+The parser test tries 916 ways of splitting four example responses into chunks.
+It covers parallel calls, typed arguments, JSON bodies, and zero-argument calls.
+These are parser tests, not 916 model requests.
 
 The benchmark scripts require `encoding/encoding.py` alongside the tokenizer.
 If reusing a weights folder without it, run `download.py --metadata-only` with
@@ -38,8 +39,8 @@ docker run --rm --gpus device=0 -v "$PWD/runs:/runs" deepseek-v41-h100:cached \
   python3 /opt/experiment/tests/scorer.py
 ```
 
-These compare selected KV values, FlashMLA outputs, masked index scores,
-selected indices, and dynamic graph replay, including 1M-entry tables.
+These compare attention values, index scores, selected keys, and CUDA graph
+outputs, including 1M-entry tables. They test the kernels, not model quality.
 
 ## API and cache checks
 
@@ -65,8 +66,8 @@ cache reuse. Its code check validates syntax and requested structure; prose is
 a throughput test. Sampled output varies. Use an otherwise idle server: other
 conversations may evict the prefix and invalidate the cached comparison.
 
-The original generated Python sample also passed 10 of its own tests and 2,000
-independent cases. To check a newly generated sample in an isolated container:
+One generated Python function passed its 10 tests and 2,000 additional input
+cases. To check a newly generated sample in an isolated container:
 
 ```bash
 docker run --rm --network none --read-only --cap-drop ALL \
@@ -82,11 +83,11 @@ enables the original comparison-only indexer checks through 131,072 visible keys
 
 ## Limits observed
 
-- One earlier raw-scorer comparison differed by 7.6e-6. Selected keys matched.
-- Split-K changes FP32 accumulation order. Its primitive tests were not all
-  bit-exact; the 128-token full-model comparison at matched cache states was exact.
-- A probability comparison with different cache boundaries failed. The
-  controlled comparison used the same conversation and cache-generation order.
+- One earlier score comparison differed by 7.6e-6. The selected keys matched.
+- Split-K changes the order of floating-point sums. Kernel results did not
+  always match exactly. The 128-token model comparison matched when both runs
+  used the same conversation and cache state. A comparison with different cache
+  states failed.
 - The first high-resolution image at 400K exhausted a temporary mask allocation.
   Preallocated masks and shared slot reads fixed it; the subsequent test passed.
 - Tool tests passed separately, including a 400,520-token tool call. A later
