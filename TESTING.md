@@ -65,8 +65,9 @@ Packaging does not rerun the two-hour benchmark or reload the serving model.
 
 [measurements.json](results/measurements.json) and
 [validation.json](results/validation.json) summarize recorded runs. They describe
-the earlier 4K, single-conversation 400K cached, 1M, and A100 configurations. The 400K speed measurements
-precede the parser-only fix; its GPU sources and settings were unchanged.
+the earlier 4K, single-conversation 400K cached, 1M, and A100 configurations.
+The 400K speed measurements precede the parser-only fix; its GPU sources and
+settings were unchanged.
 
 [Package verification](results/package-validation.json): both images built and
 passed source-hash checks; the 400K and 1M fixtures matched their recorded hashes.

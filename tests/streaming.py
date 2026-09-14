@@ -81,4 +81,3 @@ def summarize(rows):
             'ttft_min_seconds': min(ttfts) if ttfts else None,
             'ttft_max_seconds': max(ttfts) if ttfts else None,
             'mean_stream_decode_tokens_per_second': sum(rates)/len(rates) if rates else None}
-
