@@ -16,7 +16,7 @@ def digest(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, default=Path('/sgl-workspace/sglang'))
-    parser.add_argument('--profile', choices=('cached', 'long'), default='cached')
+    parser.add_argument('--profile', choices=('cached', 'long', 'independent'), default='cached')
     parser.add_argument('--check', action='store_true', help='Verify an already patched tree.')
     args = parser.parse_args()
     profile = json.loads((ROOT / 'versions.json').read_text())['profiles'][args.profile]

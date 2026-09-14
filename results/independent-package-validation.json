@@ -1,0 +1,37 @@
+{
+  "date": "2026-09-14",
+  "passed": true,
+  "profile": "independent",
+  "docker_image_built": true,
+  "verified_patched_source_files": 13,
+  "sources_match_existing_deployment": true,
+  "serving_arguments_and_environment_match_existing_deployment": true,
+  "fixture_check": {
+    "histories": 30,
+    "total_tokens": 11998024,
+    "all_token_counts_and_sha256_match_recorded": true,
+    "inference_performed": false
+  },
+  "recorded_timing_replay": {
+    "counting": true,
+    "prose": true,
+    "note": "Recomputed from saved stream events; floating-point sum checked within 1e-14 relative tolerance."
+  },
+  "parser_chunkings_passed": 916,
+  "launcher_argument_checks": [
+    "cached",
+    "long",
+    "short",
+    "independent",
+    "mismatched image rejected"
+  ],
+  "earlier_patch_hash_checks": {
+    "cached": 6,
+    "long": 3
+  },
+  "python_syntax_checks_passed": true,
+  "gpu_primitive_rerun_during_packaging": false,
+  "full_model_reload_during_packaging": false,
+  "long_throughput_benchmark_rerun_during_packaging": false,
+  "note": "CPU-only package checks. Model, API, image, tool, and GPU validation results describe the earlier qualification runs."
+}

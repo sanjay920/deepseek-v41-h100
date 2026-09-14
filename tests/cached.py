@@ -10,8 +10,8 @@ import time
 import urllib.request
 from tokenizers import Tokenizer
 
-def fixture(tokenizer, target):
-    rng = random.Random(20260912 + target)
+def fixture(tokenizer, target, seed=None):
+    rng = random.Random(20260912 + target if seed is None else seed)
     records = [
         f'Record {i}: warehouse {rng.randrange(100,999)} received {rng.randrange(100,999)} units of item {rng.randrange(10000,99999)}.\n'
         for i in range(target//10+100)

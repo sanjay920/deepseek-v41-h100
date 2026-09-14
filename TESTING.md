@@ -1,8 +1,71 @@
 # Tests
 
+## Independent 400K conversations
+
+[Recorded results](results/independent.json): 30 distinct synthetic histories,
+three planted codes per history, then counting and prose waves of 512 output
+tokens per request. All 90 original code checks and all 30 cache checks before
+each wave passed. Counting matched the requested sequence prefixes. Six prose
+samples were reviewed for coherence; this was not a model-quality evaluation.
+
+Rates use delivered output tokens, excluding EOS. The common interval runs from
+the last stream's first token to the first stream's last token. Its aggregate
+rate divided by 30 gives 27.8 tokens/s for counting and 24.3 for prose. Averaging
+each stream from its own first token through completion gives 23.6 and 20.1;
+early streams can wait while other requests are admitted. Full-wave rates include
+that admission but exclude the earlier cold fills and cache-check requests.
+Tokenization and request serialization happen before wave timing.
+
+The first full test returned to an older version of one history after an image
+turn. That branch missed cache. Its actual refill exchange became the current
+history, and all 30 were checked again; the other 29 were never reloaded. The
+reported waves passed from those current histories. Old conversation forks are
+not guaranteed to stay cached. Keep each generated reply when continuing a test.
+
+With the long cache populated, a separate 400K tool call, cached tool-result
+round trip, and large-image request with tools passed. Separate checks covered
+seven basic API cases, twelve tool cases, and a 1920×1080 image. Primitive checks
+covered host-KV writes, staged attention, graph replay, index selection, and
+bounded sliding-window cache references.
+
+DSpark candidates reached about 2,200 aggregate tokens/s at **16K** context but
+failed cache or memory checks. They are not successful 400K results and are not
+included in the independent profile. Mixed cold-prefill/decode traffic was not
+benchmarked; this is not a measured hardware ceiling.
+
+To repeat the workload on an otherwise idle `independent` server:
+
+```bash
+docker exec deepseek-v41 python3 /opt/experiment/tests/independent.py \
+  --clients 30 --tokens 400000 --name count
+docker exec deepseek-v41 python3 /opt/experiment/tests/independent.py \
+  --clients 30 --tokens 400000 --name prose --workload prose \
+  --resume /runs/independent/count.json
+```
+
+The first command fills the histories sequentially and can take about two hours.
+Both commands check cache reuse before measuring a concurrent wave. The script
+stops on a failed retrieval or cache check and saves its result under `/runs`.
+Use `--fixtures-only` to build and hash the inputs without inference. The test
+prompts request long answers, but the measured responses stop at 512 tokens.
+
+To check the host-memory path on an idle GPU **before loading the server**:
+
+```bash
+docker run --rm --gpus device=0 --ipc=host --ulimit memlock=-1 \
+  -v "$PWD/runs:/runs" deepseek-v41-h100:independent \
+  python3 /opt/experiment/tests/host_kv.py
+```
+
+[Independent package verification](results/independent-package-validation.json)
+records the build, source hashes, fixture reproduction, and command checks.
+Packaging does not rerun the two-hour benchmark or reload the serving model.
+
+## Earlier profiles
+
 [measurements.json](results/measurements.json) and
-[validation.json](results/validation.json) summarize recorded runs. They separate
-the 4K, 400K cached, 1M, and A100 configurations. The 400K speed measurements
+[validation.json](results/validation.json) summarize recorded runs. They describe
+the earlier 4K, single-conversation 400K cached, 1M, and A100 configurations. The 400K speed measurements
 precede the parser-only fix; its GPU sources and settings were unchanged.
 
 [Package verification](results/package-validation.json): both images built and

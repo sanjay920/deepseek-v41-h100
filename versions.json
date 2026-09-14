@@ -49,6 +49,63 @@
           "after": "055abbf7534d4a1429e59ee4a74ddf9d121367b6a95080f52721e26dd885aeb8"
         }
       }
+    },
+    "independent": {
+      "patch": "patches/independent.patch",
+      "files": {
+        "python/sglang/kernels/ops/attention/dsv4/sm90_fp4_indexer.py": {
+          "before": "c00b3b1f3c8d8d8cf151d5329a72e5d404634d8116ca7c9356f1c12af694f0ff",
+          "after": "3f3d3196e80687812e69ae17689eacbe90551a58bac6146cc510a27d11abc328"
+        },
+        "python/sglang/kernels/ops/quantization/fp8_kernel.py": {
+          "before": "44ff20a04b083012bf2d4914ec1b7277f80dca764b028e5fae2063aeb4cefe09",
+          "after": "f63f2b558fe00cf6d896c319ba57859d1592e561a473d344a3497cfb559ffd9f"
+        },
+        "python/sglang/srt/distributed/device_communicators/custom_all_reduce.py": {
+          "before": "fe4ef6eee5003f0422accd49db00e2b4523e516645aeba2a2a63d545cfbb8de5",
+          "after": "4fbd8fb1e35c12c6b588b6f7dfc7bdc81320d48b63b3f59279b3e62f573ec98c"
+        },
+        "python/sglang/srt/layers/attention/deepseek_v4_backend.py": {
+          "before": "486900ed693af0573a941d6b6656ebc01ccb7ff1c44584e43ad3c0fb00a3c3a9",
+          "after": "89a35caf863ef7a48ee48b39912ab6b930c1d1f88c30cc4e24fb8db43e331103"
+        },
+        "python/sglang/srt/layers/attention/dsv4/compact_prefill_gather.py": {
+          "before": null,
+          "after": "055abbf7534d4a1429e59ee4a74ddf9d121367b6a95080f52721e26dd885aeb8"
+        },
+        "python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py": {
+          "before": "b56eca87c3706edc9dd4db0f64431b87d52864495765bc3a85af6dbde21e2a5a",
+          "after": "443595291ecf358116823e73cbbf2c088afbcd06339c0f0db645db4281bea119"
+        },
+        "python/sglang/srt/layers/communicator.py": {
+          "before": "4e1031ead6eac25d6e78a64cc08db6be10a3f707a26417415621582d0abb1c9f",
+          "after": "b48aabaac55b128184dbecdb7d179091acb17b12938411724d1cbfde5a311d6c"
+        },
+        "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py": {
+          "before": "cb118c1cd0ba11a7ea216242e485d6098162984e6e21df3b40b5248b320af190",
+          "after": "81fd1f8eed720fd94042fe24eb8110faa547aac8ae9beee0b3cb6dce2d80ee3c"
+        },
+        "python/sglang/srt/mem_cache/host_kv_staging.py": {
+          "before": null,
+          "after": "83e6d5bb6b4f12f64bd39a165a702d2851270c06d2a732ea5092c6d26aa8fadd"
+        },
+        "python/sglang/srt/mem_cache/mapped_host_kv.py": {
+          "before": null,
+          "after": "65496f3e2ec0b42344ab5aed4c2ddcee08c8648b0171b83b33fe6a3f0b3d262e"
+        },
+        "python/sglang/srt/mem_cache/unified_cache/components/swa_component.py": {
+          "before": "7f0c2fce9e64959bcc26e5b42c0a644bea1fa5318c8bc24ff5b2e5e9bfe44c6c",
+          "after": "1e21bbc71ccdd1a0b506ec398796ef4d2d29370839d9a1794e58aeeff91b8ff5"
+        },
+        "python/sglang/srt/mem_cache/unified_radix_cache.py": {
+          "before": "4d04e8f7b5a5f0e00fab9dcfa9a0e60bd81dee6e82942aec7a2bd456e87935af",
+          "after": "7e11627b2520f258bb249ce81d6910e59c9551a1974826f1a5fb94aca018e3eb"
+        },
+        "python/sglang/srt/model_executor/pool_configurator.py": {
+          "before": "4b2efeb29c7a70efcf4f406ca403bcb0ceef1f65c0f75ef6887a2eecc08c1346",
+          "after": "1196bebdbc3f37a56d2818e2dbbc2a0d0849550c2d381fbec8f45d3faf0dc348"
+        }
+      }
     }
   }
 }
