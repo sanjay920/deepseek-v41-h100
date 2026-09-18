@@ -1,0 +1,53 @@
+{
+  "date": "2026-09-18",
+  "passed": true,
+  "profile": "dspark",
+  "docker_image_built": true,
+  "build_platform": "linux/amd64 with local CPU emulation",
+  "verified_patched_source_files": 23,
+  "sources_match_qualified_release": true,
+  "serving_arguments_and_environment_match_qualified_release": true,
+  "earlier_launchers_unchanged": true,
+  "launcher_profiles_checked": [
+    "cached",
+    "long",
+    "short",
+    "independent",
+    "dspark"
+  ],
+  "mismatched_images_rejected": true,
+  "changed_base_rejected": true,
+  "fixture_check": {
+    "passed": true,
+    "histories": 30,
+    "total_tokens": 11998024,
+    "all_token_counts_and_sha256_match_recorded": true,
+    "inference_performed": false
+  },
+  "native_recorded_timing_replays": 4,
+  "chat_api_aggregate_recomputed": true,
+  "parser_chunkings_passed": 916,
+  "chat_client_mock_checks": {
+    "passed": true,
+    "concurrent_clients": 30,
+    "cache_miss_stops_before_wave": true,
+    "probe_continuation_preserved_on_failure": true,
+    "inference_performed": false
+  },
+  "long_tool_fixture_replay": {
+    "passed": true,
+    "recorded_fixture_and_messages_match": true,
+    "cases_replayed": [
+      "400k-tool-call",
+      "400k-cached-tool-result",
+      "400k-cached-tools-and-large-image"
+    ],
+    "current_image_history_preserved": true,
+    "inference_performed": false
+  },
+  "python_syntax_checks_passed": true,
+  "gpu_primitive_rerun_during_packaging": false,
+  "full_model_reload_during_packaging": false,
+  "long_throughput_benchmark_rerun_during_packaging": false,
+  "note": "CPU package checks. GPU/model measurements are the recorded September 15 qualification, not fresh inference during packaging."
+}

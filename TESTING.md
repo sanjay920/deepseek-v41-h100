@@ -1,6 +1,66 @@
 # Tests
 
-## Independent 400K conversations
+## DSpark with 30 independent histories
+
+[September 15 results](results/dspark.json): all 30 cold 400K histories retrieved
+their three planted codes. Cache and output checks passed for counting and prose
+with 512 output tokens, continued prose with 1,024, and final counting with 128.
+With the cache full,
+a separate 400K tool call, cached tool-result round trip and 1920×1080 image
+request passed. All 30 original histories then passed another cache check.
+Seven basic API cases, twelve short tool cases and image checks also passed.
+Full server logs showed no retractions or fatal errors; two allocator mapping
+warnings recovered without failing requests.
+
+The separate Chat Completions test sent full text histories from one process
+with 30 threads. All 30 cache checks and counting prefixes passed, with 512 output
+tokens each: 15,360 tokens in 35.10 seconds, or 437.65 tokens/s. That includes
+client serialization, API tokenization and admission. It excludes initial cold
+fill and writing large history artifacts. Client buffering affects individual
+stream timestamps; the whole-wave rate is the useful measurement here.
+
+The new profile fixes excessive cache eviction during speculative allocation,
+lets requests enter as soon as one slot is free, bounds prefill workspaces and
+avoids redundant score copies. Image MLP weights are created directly in host
+memory. New memory paths were compared with original kernel and weight-loading
+outputs. Prose samples were reviewed for coherence, not used as a model-quality
+evaluation. These tests do not cover mixed cold/warm traffic or 30 simultaneous
+image requests. Faster steady decoding did not improve every whole-wave result.
+
+On an otherwise idle `dspark` server, this repeats the workload and checks:
+
+```bash
+docker exec deepseek-v41 python3 /opt/experiment/tests/independent.py \
+  --clients 30 --tokens 400000 --name dspark-count
+docker exec deepseek-v41 python3 /opt/experiment/tests/independent.py \
+  --clients 30 --tokens 400000 --name dspark-prose --workload prose \
+  --resume /runs/independent/dspark-count.json
+docker exec deepseek-v41 python3 /opt/experiment/tests/independent.py \
+  --clients 30 --tokens 400000 --name dspark-prose1024 --workload prose \
+  --output-tokens 1024 --resume /runs/independent/dspark-prose.json
+docker exec deepseek-v41 python3 /opt/experiment/tests/tools.py \
+  --long --output /runs/dspark-tools-long.json
+docker exec deepseek-v41 python3 /opt/experiment/tests/independent.py \
+  --clients 30 --tokens 400000 --name dspark-final-cache --output-tokens 128 \
+  --resume /runs/independent/dspark-prose1024.json
+docker exec deepseek-v41 python3 /opt/experiment/tests/chat.py \
+  --source /runs/independent/dspark-final-cache.json --name dspark-chat
+```
+
+The first command takes roughly four hours to load the histories. The long tool
+test uses a separate fixture and adds another cold fill. Each continuation keeps
+the preceding replies; use unique output names. The chat test saves its own
+updated histories, so its earlier native source histories are no longer current.
+The original run qualified two histories before expanding to 30 and included an
+additional image fixture. These commands repeat the workload, not identical
+conversation bytes or timings. Check server logs for retractions and fatal
+errors too; a completed response alone is insufficient.
+
+[DSpark package verification](results/dspark-package-validation.json) separates
+package checks from the recorded GPU/model tests. Packaging does not repeat the
+four-hour run or reload the serving model.
+
+## Earlier ordinary-decoding profile
 
 [Recorded results](results/independent.json): 30 distinct synthetic histories,
 three planted codes per history, then counting and prose waves of 512 output
@@ -28,9 +88,10 @@ seven basic API cases, twelve tool cases, and a 1920×1080 image. Primitive chec
 covered host-KV writes, staged attention, graph replay, index selection, and
 bounded sliding-window cache references.
 
-DSpark candidates reached about 2,200 aggregate tokens/s at **16K** context but
+Earlier DSpark candidates reached about 2,200 aggregate tokens/s at **16K** context but
 failed cache or memory checks. They are not successful 400K results and are not
-included in the independent profile. Mixed cold-prefill/decode traffic was not
+included in the `independent` profile. The later `dspark` profile above passed
+the long-context gates. Mixed cold-prefill/decode traffic was not
 benchmarked; this is not a measured hardware ceiling.
 
 To repeat the workload on an otherwise idle `independent` server:
@@ -83,6 +144,7 @@ adjusting mismatched lines, and checks that the result matches the tested code.
 ```bash
 docker run --rm deepseek-v41-h100:cached python3 /opt/experiment/apply.py --check
 docker run --rm deepseek-v41-h100:cached python3 /opt/experiment/tests/tool_parser.py
+docker run --rm deepseek-v41-h100:dspark python3 /opt/experiment/apply.py --profile dspark --check
 ```
 
 The parser test tries 916 ways of splitting four example responses into chunks.

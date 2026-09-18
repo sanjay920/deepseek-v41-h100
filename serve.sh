@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# != 2 ]]; then
-  echo "Usage: $0 cached|independent|long|short PATH_TO_WEIGHTS" >&2
+  echo "Usage: $0 cached|independent|dspark|long|short PATH_TO_WEIGHTS" >&2
   exit 2
 fi
 base_image=lmsysorg/sglang@sha256:4a5d132a06a77c8331e15845f2e925adc788b00105097ad55409afa3f4fa4860
@@ -10,6 +10,25 @@ requests=1
 graphs=(--cuda-graph-max-bs-decode 1)
 runtime_env=(-e HF_HUB_OFFLINE=1)
 case "$1" in
+  dspark)
+    image=deepseek-v41-h100:dspark
+    context=409600; capacity=13107200; chunk=512; memory=0.985
+    requests=32
+    graphs=(--cuda-graph-bs-decode 1 4 32)
+    extra=(--disable-flashinfer-autotune --swa-prefix-tails 43 --enable-metrics
+      --enable-session-radix-cache --random-seed 73599507
+      --enforce-disable-flashinfer-allreduce-fusion
+      --speculative-algorithm DSPARK --speculative-dspark-block-size 3
+      --json-model-override-args '{"dspark_block_size":3}' --min-free-slots-delay 1)
+    runtime_env+=(-e DSV41_HOST_KV=1 -e DSV41_PREFER_FINISHED_CACHE=1
+      -e PYTORCH_ALLOC_CONF=expandable_segments:True
+      -e SGLANG_MEMORY_SAVER_CUDA_GRAPH=1 -e SGLANG_SWA_EVICTION_INTERVAL=4
+      -e NCCL_BUFFSIZE=1048576 -e NCCL_MAX_CTAS=8
+      -e DSV41_HOST_ROPE=1 -e DSV41_TRIM_ROPE_TABLES=0
+      -e DSV41_HOST_INPUT_EMBEDDING=1 -e DSV41_HOST_VISION_MLP=1
+      -e DSV41_VISION_ACTIVATION_REUSE=1 -e DSV41_DRAFT_HOST_SWA=1
+      -e DSV41_EXPERT_PREFILL_CHUNK=128)
+    ;;
   independent)
     image=deepseek-v41-h100:independent
     context=409600; capacity=13107200; chunk=1024; memory=0.985
@@ -38,7 +57,7 @@ case "$1" in
     context=4096; capacity=8192; chunk=512; memory=0.985
     extra=(--speculative-algorithm DSPARK --speculative-dspark-block-size 5)
     ;;
-  *) echo "Choose cached, independent, long, or short." >&2; exit 2 ;;
+  *) echo "Choose cached, independent, dspark, long, or short." >&2; exit 2 ;;
 esac
 model_dir=$(cd "$2" && pwd)
 test -f "$model_dir/model.safetensors.index.json"

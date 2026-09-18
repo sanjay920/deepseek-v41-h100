@@ -1,0 +1,1467 @@
+--- a/python/sglang/kernels/ops/attention/deepseek_v4_rope.py
++++ b/python/sglang/kernels/ops/attention/deepseek_v4_rope.py
+@@ -65,6 +65,14 @@
+     t = torch.arange(seqlen)
+     freqs = torch.outer(t, freqs)
+     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
++    import os
++    if os.environ.get("DSV41_HOST_ROPE") == "1":
++        from sglang.srt.mem_cache.mapped_host_kv import HostKVAllocation
++        allocation = HostKVAllocation(freqs_cis.shape, dtype=freqs_cis.dtype,
++                                      device=freqs_cis.device)
++        allocation.host.copy_(freqs_cis, non_blocking=False)
++        # The cached root view retains the pinned host owner.
++        freqs_cis = allocation.cuda
+     return freqs_cis
+ 
+ 
+--- a/python/sglang/kernels/ops/attention/dsv4/sm90_fp4_indexer.py
++++ b/python/sglang/kernels/ops/attention/dsv4/sm90_fp4_indexer.py
+@@ -36,6 +36,239 @@
+     q_ptr,  # [B, H, D] bf16, fq4 queries (already rope'd)
+     w_ptr,  # [B, H] bf16 head weights (softmax scale folded in)
+     slots_ptr,  # [B, L] int64 pool slots per (request, compressed position)
++    lens_ptr,  # [B] int64 visible compressed positions per request
++    table_ptr,  # [num_pages, page_size * 64 + page_size * 4] uint8
++    out_ptr,  # [B, L] fp32 logits, -inf beyond lens
++    L,
++    page_size,
++    row_stride,
++    stride_qb,
++    stride_qh,
++    stride_wb,
++    stride_slots_b,
++    H: tl.constexpr,
++    HALF_D: tl.constexpr,  # D // 2 == 64 nibble-pairs per row
++    BLOCK_L: tl.constexpr,
++):
++    b = tl.program_id(0)
++    lb = tl.program_id(1)
++    offs_l = lb * BLOCK_L + tl.arange(0, BLOCK_L)
++    offs_h = tl.arange(0, H)
++    offs_i = tl.arange(
++        0, HALF_D
++    )  # byte index i holds elements 2i (low nibble), 2i+1 (high nibble)
++
++    n_vis = tl.load(lens_ptr + b)
++    valid = offs_l < tl.minimum(n_vis, L)
++    slot = tl.load(slots_ptr + b * stride_slots_b + offs_l, mask=offs_l < L, other=0).to(tl.int64)
++    page = slot // page_size
++    off = slot % page_size
++    row_base = page * row_stride
++
++    # K payload: [BLOCK_L, HALF_D] uint8
++    pay = tl.load(
++        table_ptr + row_base[:, None] + off[:, None] * PAYLOAD_BYTES + offs_i[None, :],
++        mask=valid[:, None],
++        other=0,
++    )
++    low = _e2m1_decode(pay & 0x0F)
++    high = _e2m1_decode((pay >> 4) & 0x0F)
++    # e8m0 block scales: element j uses block j // 32 -> byte i uses block i // 16.
++    sc_idx = offs_i // 16
++    exps = tl.load(
++        table_ptr
++        + row_base[:, None]
++        + page_size * PAYLOAD_BYTES
++        + off[:, None] * SCALE_BYTES
++        + sc_idx[None, :],
++        mask=valid[:, None],
++        other=127,
++    )
++    scale = tl.exp2(exps.to(tl.float32) - 127.0)
++    k_low = (low * scale).to(tl.bfloat16)  # [BLOCK_L, HALF_D] elements 2i
++    k_high = (high * scale).to(tl.bfloat16)  # elements 2i+1
++
++    # queries: even / odd elements, [H, HALF_D] bf16
++    q_even = tl.load(
++        q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :]
++    )
++    q_odd = tl.load(
++        q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :] + 1
++    )
++
++    acc = tl.dot(q_even, tl.trans(k_low))  # [H, BLOCK_L] fp32
++    acc += tl.dot(q_odd, tl.trans(k_high))
++    # reference rounding points: bf16 dot -> relu -> * bf16 weight -> bf16 -> sum -> bf16
++    s = acc.to(tl.bfloat16).to(tl.float32)
++    s = tl.maximum(s, 0.0)
++    w = tl.load(w_ptr + b * stride_wb + offs_h).to(tl.float32)
++    s = (s * w[:, None]).to(tl.bfloat16).to(tl.float32)
++    logit = tl.sum(s, axis=0).to(tl.bfloat16).to(tl.float32)
++    logit = tl.where(valid, logit, float("-inf"))
++    tl.store(out_ptr + b * L + offs_l, logit, mask=offs_l < L)
++
++
++def fp4_index_logits_decode(
++    q: torch.Tensor,
++    weights: torch.Tensor,
++    slots: torch.Tensor,
++    lens: torch.Tensor,
++    table: torch.Tensor,
++    page_size: int,
++) -> torch.Tensor:
++    """q [B, H, 128] bf16, weights [B, H], slots [B, L] int64, lens [B] int64,
++    table = the layer's fp4 index-K page buffer (uint8, 2D). Returns [B, L] fp32
++    logits with -inf at positions >= lens."""
++    assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
++    B, H, _ = q.shape
++    L = slots.shape[1]
++    assert table.dtype == torch.uint8 and table.dim() == 2
++    q = q.contiguous()
++    weights = weights.to(torch.bfloat16).contiguous()
++    # Prefill shares one physical slot row across queries (row stride zero).
++    if slots.stride(1) != 1:
++        slots = slots.contiguous()
++    out = torch.empty((B, L), dtype=torch.float32, device=q.device)
++    if L == 0:
++        return out
++    BLOCK_L = 64
++    grid = (B, triton.cdiv(L, BLOCK_L))
++    _fp4_index_logits_kernel[grid](
++        q,
++        weights,
++        slots,
++        lens.to(torch.int64).contiguous(),
++        table,
++        out,
++        L,
++        page_size,
++        table.stride(0),
++        q.stride(0),
++        q.stride(1),
++        weights.stride(0),
++        slots.stride(0),
++        H=H,
++        HALF_D=INDEX_HEAD_DIM // 2,
++        BLOCK_L=BLOCK_L,
++        num_warps=4,
++    )
++    return out
++
++
++@triton.jit
++def _fp4_index_logits_candidates_kernel(
++    q_ptr,  # [B, H, D] bf16, fq4 queries (already rope'd)
++    w_ptr,  # [B, H] bf16 head weights (softmax scale folded in)
++    slots_ptr,  # [B, L] int64 pool slots per (request, compressed position)
++    lens_ptr,  # [B] int64 visible compressed positions per request
++    table_ptr,  # [num_pages, page_size * 64 + page_size * 4] uint8
++    out_ptr,  # [B, L] fp32 logits, -inf beyond lens
++    L,
++    page_size,
++    row_stride,
++    stride_qb,
++    stride_qh,
++    stride_wb,
++    mask_ptr,
++    stride_mask_b,
++    H: tl.constexpr,
++    HALF_D: tl.constexpr,  # D // 2 == 64 nibble-pairs per row
++    BLOCK_L: tl.constexpr,
++):
++    b = tl.program_id(0)
++    lb = tl.program_id(1)
++    offs_l = lb * BLOCK_L + tl.arange(0, BLOCK_L)
++    offs_h = tl.arange(0, H)
++    offs_i = tl.arange(
++        0, HALF_D
++    )  # byte index i holds elements 2i (low nibble), 2i+1 (high nibble)
++
++    n_vis = tl.load(lens_ptr + b)
++    valid = offs_l < tl.minimum(n_vis, L)
++    candidate = tl.load(mask_ptr + b * stride_mask_b + offs_l, mask=offs_l < L, other=0)
++    active = tl.sum((candidate & valid).to(tl.int32), axis=0) > 0
++    if active:
++        slot = tl.load(slots_ptr + b * L + offs_l, mask=offs_l < L, other=0).to(tl.int64)
++        page = slot // page_size
++        off = slot % page_size
++        row_base = page * row_stride
++    
++        # K payload: [BLOCK_L, HALF_D] uint8
++        pay = tl.load(
++            table_ptr + row_base[:, None] + off[:, None] * PAYLOAD_BYTES + offs_i[None, :],
++            mask=valid[:, None],
++            other=0,
++        )
++        low = _e2m1_decode(pay & 0x0F)
++        high = _e2m1_decode((pay >> 4) & 0x0F)
++        # e8m0 block scales: element j uses block j // 32 -> byte i uses block i // 16.
++        sc_idx = offs_i // 16
++        exps = tl.load(
++            table_ptr
++            + row_base[:, None]
++            + page_size * PAYLOAD_BYTES
++            + off[:, None] * SCALE_BYTES
++            + sc_idx[None, :],
++            mask=valid[:, None],
++            other=127,
++        )
++        scale = tl.exp2(exps.to(tl.float32) - 127.0)
++        k_low = (low * scale).to(tl.bfloat16)  # [BLOCK_L, HALF_D] elements 2i
++        k_high = (high * scale).to(tl.bfloat16)  # elements 2i+1
++    
++        # queries: even / odd elements, [H, HALF_D] bf16
++        q_even = tl.load(
++            q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :]
++        )
++        q_odd = tl.load(
++            q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :] + 1
++        )
++    
++        acc = tl.dot(q_even, tl.trans(k_low))  # [H, BLOCK_L] fp32
++        acc += tl.dot(q_odd, tl.trans(k_high))
++        # reference rounding points: bf16 dot -> relu -> * bf16 weight -> bf16 -> sum -> bf16
++        s = acc.to(tl.bfloat16).to(tl.float32)
++        s = tl.maximum(s, 0.0)
++        w = tl.load(w_ptr + b * stride_wb + offs_h).to(tl.float32)
++        s = (s * w[:, None]).to(tl.bfloat16).to(tl.float32)
++        logit = tl.sum(s, axis=0).to(tl.bfloat16).to(tl.float32)
++        logit = tl.where(valid, logit, float("-inf"))
++    else:
++        logit = tl.full((BLOCK_L,), float("-inf"), tl.float32)
++    tl.store(out_ptr + b * L + offs_l, logit, mask=offs_l < L)
++
++
++_fp4_index_logits_decode_unmasked = fp4_index_logits_decode
++
++
++def fp4_index_logits_decode(q, weights, slots, lens, table, page_size, candidate_mask=None):
++    # Keep the ordinary scorer for source layers, prefill, and short contexts.
++    if candidate_mask is None or slots.shape[1] < 65536:
++        return _fp4_index_logits_decode_unmasked(q, weights, slots, lens, table, page_size)
++    b, h, _ = q.shape
++    length = slots.shape[1]
++    assert candidate_mask.shape == (b, length) and candidate_mask.dtype == torch.bool
++    q = q.contiguous()
++    weights = weights.to(torch.bfloat16).contiguous()
++    slots = slots.contiguous()
++    candidate_mask = candidate_mask.contiguous()
++    out = torch.empty((b, length), dtype=torch.float32, device=q.device)
++    _fp4_index_logits_candidates_kernel[(b, triton.cdiv(length, 64))](
++        q, weights, slots, lens.to(torch.int64).contiguous(), table, out,
++        length, page_size, table.stride(0), q.stride(0), q.stride(1), weights.stride(0),
++        candidate_mask, candidate_mask.stride(0), H=h, HALF_D=64, BLOCK_L=64, num_warps=4,
++    )
++    return out
++
++
++@triton.jit
++def _fp4_index_logits_reqmap_kernel(
++    q_ptr,  # [B, H, D] bf16, fq4 queries (already rope'd)
++    w_ptr,  # [B, H] bf16 head weights (softmax scale folded in)
++    reqmap_ptr,
++    req_ptr,
++    reqmap_stride,
++    ratio: tl.constexpr,  # [B, L] int64 pool slots per (request, compressed position)
+     lens_ptr,  # [B] int64 visible compressed positions per request
+     table_ptr,  # [num_pages, page_size * 64 + page_size * 4] uint8
+     out_ptr,  # [B, L] fp32 logits, -inf beyond lens
+@@ -59,7 +292,7 @@
+ 
+     n_vis = tl.load(lens_ptr + b)
+     valid = offs_l < tl.minimum(n_vis, L)
+-    slot = tl.load(slots_ptr + b * L + offs_l, mask=offs_l < L, other=0).to(tl.int64)
++    slot = (tl.load(reqmap_ptr + tl.load(req_ptr + b).to(tl.int64) * reqmap_stride + offs_l * ratio, mask=valid, other=0).to(tl.int64) // ratio)
+     page = slot // page_size
+     off = slot % page_size
+     row_base = page * row_stride
+@@ -70,8 +303,6 @@
+         mask=valid[:, None],
+         other=0,
+     )
+-    low = _e2m1_decode(pay & 0x0F)
+-    high = _e2m1_decode((pay >> 4) & 0x0F)
+     # e8m0 block scales: element j uses block j // 32 -> byte i uses block i // 16.
+     sc_idx = offs_i // 16
+     exps = tl.load(
+@@ -83,9 +314,7 @@
+         mask=valid[:, None],
+         other=127,
+     )
+-    scale = tl.exp2(exps.to(tl.float32) - 127.0)
+-    k_low = (low * scale).to(tl.bfloat16)  # [BLOCK_L, HALF_D] elements 2i
+-    k_high = (high * scale).to(tl.bfloat16)  # elements 2i+1
++    k_low, k_high = _fp4_pair_to_bf16_bits(pay, exps)
+ 
+     # queries: even / odd elements, [H, HALF_D] bf16
+     q_even = tl.load(
+@@ -107,45 +336,139 @@
+     tl.store(out_ptr + b * L + offs_l, logit, mask=offs_l < L)
+ 
+ 
+-def fp4_index_logits_decode(
+-    q: torch.Tensor,
+-    weights: torch.Tensor,
+-    slots: torch.Tensor,
+-    lens: torch.Tensor,
+-    table: torch.Tensor,
+-    page_size: int,
+-) -> torch.Tensor:
+-    """q [B, H, 128] bf16, weights [B, H], slots [B, L] int64, lens [B] int64,
+-    table = the layer's fp4 index-K page buffer (uint8, 2D). Returns [B, L] fp32
+-    logits with -inf at positions >= lens."""
+-    assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
+-    B, H, _ = q.shape
+-    L = slots.shape[1]
+-    assert table.dtype == torch.uint8 and table.dim() == 2
++@triton.jit
++def _fp4_index_logits_candidates_reqmap_kernel(
++    q_ptr,  # [B, H, D] bf16, fq4 queries (already rope'd)
++    w_ptr,  # [B, H] bf16 head weights (softmax scale folded in)
++    reqmap_ptr,
++    req_ptr,
++    reqmap_stride,
++    ratio: tl.constexpr,  # [B, L] int64 pool slots per (request, compressed position)
++    lens_ptr,  # [B] int64 visible compressed positions per request
++    table_ptr,  # [num_pages, page_size * 64 + page_size * 4] uint8
++    out_ptr,  # [B, L] fp32 logits, -inf beyond lens
++    L,
++    page_size,
++    row_stride,
++    stride_qb,
++    stride_qh,
++    stride_wb,
++    mask_ptr,
++    stride_mask_b,
++    H: tl.constexpr,
++    HALF_D: tl.constexpr,  # D // 2 == 64 nibble-pairs per row
++    BLOCK_L: tl.constexpr,
++):
++    b = tl.program_id(0)
++    lb = tl.program_id(1)
++    offs_l = lb * BLOCK_L + tl.arange(0, BLOCK_L)
++    offs_h = tl.arange(0, H)
++    offs_i = tl.arange(
++        0, HALF_D
++    )  # byte index i holds elements 2i (low nibble), 2i+1 (high nibble)
++
++    n_vis = tl.load(lens_ptr + b)
++    valid = offs_l < tl.minimum(n_vis, L)
++    candidate = tl.load(mask_ptr + b * stride_mask_b + offs_l, mask=offs_l < L, other=0)
++    active = tl.sum((candidate & valid).to(tl.int32), axis=0) > 0
++    if active:
++        slot = (tl.load(reqmap_ptr + tl.load(req_ptr + b).to(tl.int64) * reqmap_stride + offs_l * ratio, mask=valid, other=0).to(tl.int64) // ratio)
++        page = slot // page_size
++        off = slot % page_size
++        row_base = page * row_stride
++    
++        # K payload: [BLOCK_L, HALF_D] uint8
++        pay = tl.load(
++            table_ptr + row_base[:, None] + off[:, None] * PAYLOAD_BYTES + offs_i[None, :],
++            mask=valid[:, None],
++            other=0,
++        )
++        # e8m0 block scales: element j uses block j // 32 -> byte i uses block i // 16.
++        sc_idx = offs_i // 16
++        exps = tl.load(
++            table_ptr
++            + row_base[:, None]
++            + page_size * PAYLOAD_BYTES
++            + off[:, None] * SCALE_BYTES
++            + sc_idx[None, :],
++            mask=valid[:, None],
++            other=127,
++        )
++        k_low, k_high = _fp4_pair_to_bf16_bits(pay, exps)
++    
++        # queries: even / odd elements, [H, HALF_D] bf16
++        q_even = tl.load(
++            q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :]
++        )
++        q_odd = tl.load(
++            q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :] + 1
++        )
++    
++        acc = tl.dot(q_even, tl.trans(k_low))  # [H, BLOCK_L] fp32
++        acc += tl.dot(q_odd, tl.trans(k_high))
++        # reference rounding points: bf16 dot -> relu -> * bf16 weight -> bf16 -> sum -> bf16
++        s = acc.to(tl.bfloat16).to(tl.float32)
++        s = tl.maximum(s, 0.0)
++        w = tl.load(w_ptr + b * stride_wb + offs_h).to(tl.float32)
++        s = (s * w[:, None]).to(tl.bfloat16).to(tl.float32)
++        logit = tl.sum(s, axis=0).to(tl.bfloat16).to(tl.float32)
++        logit = tl.where(valid, logit, float("-inf"))
++    else:
++        logit = tl.full((BLOCK_L,), float("-inf"), tl.float32)
++    tl.store(out_ptr + b * L + offs_l, logit, mask=offs_l < L)
++
++
++def fp4_index_logits_reqmap(q, weights, reqmap, req, lens, table, page_size,
++                           ratio, length, candidate_mask=None):
++    assert ratio in (1, 2)
++    assert q.dtype == torch.bfloat16 and q.shape[-1] == 128
++    b, h, _ = q.shape
++    assert req.shape == lens.shape == (b,)
++    assert reqmap.stride(1) == 1 and length * ratio <= reqmap.shape[1]
++    assert table.dtype == torch.uint8 and table.ndim == 2
+     q = q.contiguous()
+     weights = weights.to(torch.bfloat16).contiguous()
+-    slots = slots.contiguous()
+-    out = torch.empty((B, L), dtype=torch.float32, device=q.device)
+-    if L == 0:
++    req = req.contiguous()
++    lens = lens.to(torch.int64).contiguous()
++    out = torch.empty((b, length), dtype=torch.float32, device=q.device)
++    if length == 0:
+         return out
+-    BLOCK_L = 64
+-    grid = (B, triton.cdiv(L, BLOCK_L))
+-    _fp4_index_logits_kernel[grid](
+-        q,
+-        weights,
+-        slots,
+-        lens.to(torch.int64).contiguous(),
+-        table,
+-        out,
+-        L,
+-        page_size,
+-        table.stride(0),
+-        q.stride(0),
+-        q.stride(1),
+-        weights.stride(0),
+-        H=H,
+-        HALF_D=INDEX_HEAD_DIM // 2,
+-        BLOCK_L=BLOCK_L,
+-        num_warps=4,
+-    )
++    args = (q, weights, reqmap, req, reqmap.stride(0), ratio, lens, table, out,
++            length, page_size, table.stride(0), q.stride(0), q.stride(1), weights.stride(0))
++    grid = (b, triton.cdiv(length, 64))
++    if candidate_mask is not None and length >= 65536:
++        assert candidate_mask.shape == (b, length) and candidate_mask.dtype == torch.bool
++        candidate_mask = candidate_mask.contiguous()
++        _fp4_index_logits_candidates_reqmap_kernel[grid](
++            *args, candidate_mask, candidate_mask.stride(0), H=h, HALF_D=64,
++            BLOCK_L=64, num_warps=4)
++    else:
++        _fp4_index_logits_reqmap_kernel[grid](
++            *args, H=h, HALF_D=64, BLOCK_L=64, num_warps=4)
+     return out
++
++
++@triton.jit
++def _fp4_pair_to_bf16_bits(pay, exps):
++    # All nonzero E2M1 levels are normal finite BF16 in this scale range.
++    # Exceptional scales keep the original FP32 arithmetic and conversion.
++    ordinary = tl.sum(((exps < 2) | (exps > 252)).to(tl.int32)) == 0
++    if ordinary:
++        lo = (pay & 15).to(tl.int32)
++        hi = (pay >> 4).to(tl.int32)
++        elo = (lo >> 1) & 3
++        ehi = (hi >> 1) & 3
++        mlo = lo & 1
++        mhi = hi & 1
++        blo = ((exps.to(tl.int32) + elo - 1) << 7) | tl.where(elo > 0, mlo << 6, 0)
++        bhi = ((exps.to(tl.int32) + ehi - 1) << 7) | tl.where(ehi > 0, mhi << 6, 0)
++        # Match the original Triton formula, which canonicalizes negative zero.
++        blo = tl.where((lo & 7) == 0, 0, blo | ((lo & 8) << 12))
++        bhi = tl.where((hi & 7) == 0, 0, bhi | ((hi & 8) << 12))
++        low = blo.to(tl.uint16).to(tl.bfloat16, bitcast=True)
++        high = bhi.to(tl.uint16).to(tl.bfloat16, bitcast=True)
++    else:
++        scale = tl.exp2(exps.to(tl.float32) - 127.)
++        low = (_e2m1_decode(pay & 15) * scale).to(tl.bfloat16)
++        high = (_e2m1_decode(pay >> 4) * scale).to(tl.bfloat16)
++    return low, high
+--- a/python/sglang/kernels/ops/quantization/fp8_kernel.py
++++ b/python/sglang/kernels/ops/quantization/fp8_kernel.py
+@@ -1661,6 +1661,14 @@
+     return C
+ 
+ 
++# Measured Hopper tiles; native weights and activation quantization are unchanged.
++# Split-K changes FP32 summation order; see the qualification receipt.
++_DSV41_SMALL_DENSE_CONFIGS = {'512,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 16, 'SWAP_AB': False}, '1152,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 16, 'SWAP_AB': False}, '1280,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 16, 'SWAP_AB': False}, '1536,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 16, 'SWAP_AB': False}, '1792,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 16, 'SWAP_AB': False}, '4096,1280': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 8, 'SWAP_AB': False}, '5120,576': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 4, 'SWAP_AB': False}, '5120,2048': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 8, 'SWAP_AB': False}, '5120,15360': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 8, 'SWAP_AB': False}, '8192,1280': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 4, 'SWAP_AB': False}, '25600,6144': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3, 'SPLIT_K': 4, 'SWAP_AB': False}}
++
++
++_DSV41_AGGREGATE_DENSE_CONFIGS = {'32,512,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '32,1152,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '32,1280,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '32,1536,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '32,1792,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '32,4096,1280': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '32,5120,576': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '32,5120,2048': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '32,5120,15360': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '32,8192,1280': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '32,25600,6144': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '64,512,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '64,1152,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '64,1280,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '64,1536,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '64,1792,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '64,4096,1280': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '64,5120,576': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '64,5120,2048': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '64,5120,15360': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '64,8192,1280': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '64,25600,6144': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '128,512,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '128,1152,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '128,1280,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '128,1536,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '128,1792,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '128,4096,1280': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '128,5120,576': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '128,5120,2048': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '128,5120,15360': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '128,8192,1280': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '128,25600,6144': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '192,512,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '192,1152,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '192,1280,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '192,1536,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '192,1792,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '192,4096,1280': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '192,5120,576': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '192,5120,2048': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '192,5120,15360': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '192,8192,1280': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '192,25600,6144': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '384,512,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '384,1152,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '384,1280,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '384,1536,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '384,1792,5120': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '384,4096,1280': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '384,5120,576': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '384,5120,2048': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '384,5120,15360': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '384,8192,1280': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}, '384,25600,6144': {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 32, 'num_warps': 4, 'num_stages': 3}}
++
++
+ def w8a8_block_fp8_matmul_triton(
+     A: torch.Tensor,
+     B: torch.Tensor,
+@@ -1706,6 +1714,12 @@
+             "num_warps": 4,
+             "num_stages": 3,
+         }
++
++    if get_platform().is_sm90 and 0 < M <= 6 and (block_n, block_k) == (32, 32):
++        config = _DSV41_SMALL_DENSE_CONFIGS.get(f"{N},{K}", config)
++
++    if get_platform().is_sm90 and M > 6 and (block_n, block_k) == (32, 32):
++        config = _DSV41_AGGREGATE_DENSE_CONFIGS.get(f"{M},{N},{K}", config)
+ 
+     if _is_gfx1250:
+         config = {**config, "num_stages": 1}
+--- a/python/sglang/srt/distributed/device_communicators/custom_all_reduce.py
++++ b/python/sglang/srt/distributed/device_communicators/custom_all_reduce.py
+@@ -308,6 +308,21 @@
+ 
+     def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
+         """The main allreduce API that provides support for cuda graph."""
++        # Large eager prefill uses the same reduction arithmetic in bounded
++        # pieces. Decode graphs remain on their original small-input path.
++        if (
++            not self.disabled and not self._IS_CAPTURING
++            and input.is_contiguous()
++            and input.dtype in (torch.float16, torch.bfloat16)
++            and input.shape[0] > 256
++            and input.numel() * input.element_size() % 16 == 0
++        ):
++            parts = input.split(256, dim=0)
++            if any(part.numel() * part.element_size() > self.max_size for part in parts):
++                return None
++            return torch.cat([
++                self._all_reduce_impl(part, registered=False) for part in parts
++            ]).view_as(input)
+         # When custom allreduce is disabled, this will be None.
+         if self.disabled or not self.should_custom_ar(input):
+             return None
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -2,6 +2,7 @@
+ 
+ import enum
+ import functools
++import os
+ import logging
+ from dataclasses import dataclass, field
+ from typing import (
+@@ -38,7 +39,7 @@
+     init_compression_metadata as _init_compression_metadata_triton,
+ )
+ from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
+-from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import fp4_index_logits_decode
++from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import fp4_index_logits_decode, fp4_index_logits_reqmap
+ from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+     BuildCausalSwaPageIndices,
+     BuildPageTablePositions,
+@@ -76,6 +77,7 @@
+     copy_metadata,
+     maybe_copy_inplace,
+ )
++from sglang.srt.layers.attention.dsv4.compact_prefill_gather import compact_prefill_gather
+ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+     SparsePrefillChunkCache,
+     SparsePrefillWorkspace,
+@@ -328,7 +330,10 @@
+ 
+ 
+ # Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
+-_TORCH_INDEXER_SCORE_BUDGET_BYTES = 1 << 30
++# Four-H100 long-context experiment: retain the existing row batching,
++# but cap each BF16 score tensor at 32 MiB instead of 1 GiB.
++_TORCH_INDEXER_SCORE_BUDGET_BYTES = 1 << 25
++_DSV41_PREFILL_SHADOW_MAX_KEYS = int(os.environ.get("DSV41_PREFILL_SHADOW_MAX_KEYS", "0"))
+ 
+ 
+ def _mask_topk_scores(
+@@ -3464,6 +3469,9 @@
+         table (Triton), then the same candidate / top-k contract as the DeepGEMM
+         path: level-one candidate blocks where the layer publishes or consumes them,
+         and -1 padded slots with the valid prefix first."""
++        # A new index source always replaces the previous packed selection.
++        # Drop its Python reference before allocating new index scratch.
++        self.forward_metadata._host_kv_staged = None
+         pool = self.token_to_kv_pool
+         core = self.forward_metadata.core_metadata
+         ratio = layer.compress_ratio
+@@ -3491,18 +3499,40 @@
+         lmax = min(metadata.max_c4_seq_len, self.req_to_token.shape[1] // ratio)
+         if lmax == 0:
+             return
++        if indexer.is_candidate_source:
++            self.candidate_masks = None
+         q = indexer.queries(q_lora, layer.freqs_cis[pos])
+         weights = indexer.head_weights(x)
+-        j = torch.arange(lmax, device=pos.device)
+-        valid = j[None, :] < lens[:, None]
+-        slots = (
+-            self.req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64)
+-            // ratio
+-        )
+-        slots = slots.masked_fill(~valid, 0)
++
++        # Keep the full-batch projection kernels and their rounding points.
++        # Every rank owns the same index keys; divide only independent queries.
++        group = get_tp_group()
++        query_parallel = (
++            group.world_size > 1
++            and get_parallel().attn_tp_size == group.world_size
++            and get_parallel().attn_cp_size == 1
++            and bs >= group.world_size
++            and bs % group.world_size == 0
++        )
++        full_page_indices, full_raw_indices = page_indices, raw_indices
++        if query_parallel:
++            local_bs = bs // group.world_size
++            first = group.rank_in_group * local_bs
++            rows = slice(first, first + local_bs)
++            q, weights = q[rows], weights[rows]
++            req, lens = req[rows], lens[rows]
++            page_indices = page_indices[rows]
++            if raw_indices is not None:
++                raw_indices = raw_indices[rows]
++            bs = local_bs
+         table = pool.get_index_k_with_scale_buffer(layer.layer_id)
+-        s = fp4_index_logits_decode(
+-            q, weights, slots, lens, table, table.shape[1] // 68
++        candidate_mask = None
++        if indexer.uses_candidates and not indexer.is_candidate_source:
++            assert torch.is_tensor(self.candidate_masks) and self.candidate_masks.shape[0] == bs
++            candidate_mask = self.candidate_masks[:, :lmax]
++        s = fp4_index_logits_reqmap(
++            q, weights, self.req_to_token, req, lens, table,
++            table.shape[1] // 68, ratio, lmax, candidate_mask=candidate_mask,
+         )
+         if indexer.is_candidate_source:
+             self.candidate_masks = select_candidate_blocks(
+@@ -3517,7 +3547,7 @@
+             assert torch.is_tensor(consume) and consume.shape[0] == bs, (
+                 "candidate mask missing for decode"
+             )
+-            s = s.masked_fill(~consume[:, :lmax], -torch.inf)
++            s.masked_fill_(~consume[:, :lmax], -torch.inf)
+         k = min(indexer.index_topk, lmax)
+         idx = s.topk(k, dim=-1, sorted=False).indices
+         if indexer.uses_candidates and not indexer.is_candidate_source:
+@@ -3526,10 +3556,15 @@
+         idx = idx.sort(dim=-1).values
+         reach = idx < lens[:, None]
+         page_indices[:bs, :k] = torch.where(
+-            reach, slots.gather(1, idx.clamp_max(lmax - 1)), -1
++            reach, self.req_to_token[req[:, None], idx.clamp_max(lmax - 1) * ratio].to(torch.int64) // ratio, -1
+         ).to(torch.int32)
+         if raw_indices is not None:
+             raw_indices[:bs, :k] = torch.where(reach, idx, -1).to(torch.int32)
++        if query_parallel:
++            full_page_indices.copy_(group.all_gather(page_indices.contiguous(), dim=0))
++            if raw_indices is not None:
++                full_raw_indices.copy_(group.all_gather(raw_indices.contiguous(), dim=0))
++
+ 
+     def _low_ratio_index_topk_torch(self, layer, x, q_lora, req, pos) -> None:
+         pool = self.token_to_kv_pool
+@@ -3548,6 +3583,9 @@
+         compress_lens = (pos + 1) // ratio
+         topk = indexer.index_topk
+         publish = [] if indexer.is_candidate_source else None
++        if indexer.is_candidate_source:
++            # This layer replaces the prior step's mask before any consumer reads it.
++            self.candidate_masks = None
+         consume = self.candidate_masks if indexer.uses_candidates else None
+         for b, r in enumerate(torch.unique_consecutive(req).tolist()):
+             tok = (req == r).nonzero().squeeze(1)
+@@ -3564,44 +3602,91 @@
+             slots_j = self.req_to_token[r, j * ratio].to(torch.int64) // ratio
+             # Dequantize only this request's visible K rows; the full table is
+             # pool-sized.
+-            index_k = pool.get_low_ratio_index_k_dequant(layer.layer_id, slots_j)
++            # The installed Hopper scorer reads the same packed rows directly.
++            # Keep the original dequantized values only for qualification checks.
++            shadow = lc <= _DSV41_PREFILL_SHADOW_MAX_KEYS
++            index_k = None
++            if shadow:
++                index_k = torch.cat([
++                    pool.get_low_ratio_index_k_dequant(layer.layer_id, part)
++                    for part in slots_j.split(32768)
++                ])
++            index_table = pool.get_index_k_with_scale_buffer(layer.layer_id)
+             k = min(topk, lc)
+             # Every step below is per query row; chunk rows so the [rows, heads, lc]
+             # bf16 scores stay under the budget (16 GiB at once for a 16k-token prompt).
+-            rows_per_chunk = max(
+-                1,
+-                _TORCH_INDEXER_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2),
+-            )
+-            masks = [] if publish is not None else None
++            # Budget FP32 output scores; no [rows,heads,keys] intermediate.
++            rows_per_chunk = min(32, max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (lc * 4)))
++            masks = (
++                torch.empty((tok.numel(), (lc + indexer.candidate_block_size - 1) // indexer.candidate_block_size), dtype=torch.bool, device=pos.device)
++                if publish is not None else None
++            )
+             for start in range(0, tok.numel(), rows_per_chunk):
+                 rows = slice(start, start + rows_per_chunk)
+                 tok_c, lens_c = tok[rows], lens[rows]
+-                s = indexer.scores(q[tok_c], index_k, weights[tok_c])
+-                s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
++                expanded_mask = (
++                    consume[b][rows].repeat_interleave(indexer.candidate_block_size, dim=1)[:, :lc]
++                    if consume is not None and masks is None else None
++                )
++                s = fp4_index_logits_reqmap(
++                    q[tok_c], weights[tok_c], self.req_to_token, req[tok_c],
++                    lens_c, index_table, index_table.shape[1] // 68, ratio, lc,
++                    candidate_mask=expanded_mask,
++                )
++                s.masked_fill_(j[None, :] >= lens_c[:, None], -torch.inf)
++                reference_s = None
++                if shadow:
++                    oracle_rows = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2))
++                    reference_s = torch.cat([
++                        indexer.scores(q[part], index_k, weights[part])
++                        for part in tok_c.split(oracle_rows)
++                    ])
++                    reference_s.masked_fill_(j[None, :] >= lens_c[:, None], -torch.inf)
+                 if masks is not None:
+-                    masks.append(
+-                        select_candidate_blocks(
+-                            s,
+-                            lens_c[:, None],
++                    mask_chunk = select_candidate_blocks(
++                        s,
++                        lens_c[:, None],
++                        topk_blocks=indexer.candidate_topk_blocks,
++                        block_size=indexer.candidate_block_size,
++                    )
++                    masks[rows].copy_(mask_chunk[:, ::indexer.candidate_block_size])
++                    if shadow:
++                        reference_mask = select_candidate_blocks(
++                            reference_s, lens_c[:, None],
+                             topk_blocks=indexer.candidate_topk_blocks,
+                             block_size=indexer.candidate_block_size,
+                         )
+-                    )
++                        if not torch.equal(mask_chunk, reference_mask):
++                            raise RuntimeError(f"DSV41 prefill candidate-mask mismatch: layer={layer.layer_id}, keys={lc}")
+                 elif consume is not None:
+-                    s = s.masked_fill(~consume[b][rows], -torch.inf)
++                    s.masked_fill_(~expanded_mask, -torch.inf)
++                    if shadow:
++                        reference_s.masked_fill_(~expanded_mask, -torch.inf)
+                 idx = s.topk(k, dim=-1, sorted=False).indices
+                 if consume is not None and masks is None:
+                     idx = _mask_topk_scores(s, idx)
+                     idx = idx.masked_fill(idx < 0, lc)
+                 idx = idx.sort(dim=-1).values
+                 reach = idx < lens_c[:, None]
++                if shadow:
++                    reference_idx = reference_s.topk(k, dim=-1, sorted=False).indices
++                    if consume is not None and masks is None:
++                        reference_idx = _mask_topk_scores(reference_s, reference_idx)
++                        reference_idx = reference_idx.masked_fill(reference_idx < 0, lc)
++                    reference_idx = reference_idx.sort(dim=-1).values
++                    actual_visible = torch.where(reach, idx, -1)
++                    reference_visible = torch.where(reference_idx < lens_c[:, None], reference_idx, -1)
++                    if not torch.equal(actual_visible, reference_visible):
++                        raise RuntimeError(f"DSV41 prefill selected-key mismatch: layer={layer.layer_id}, keys={lc}")
+                 page_indices[tok_c, :k] = torch.where(
+                     reach, slots_j[idx.clamp_max(lc - 1)], -1
+                 ).to(torch.int32)
+                 if raw_indices is not None:
+                     raw_indices[tok_c, :k] = torch.where(reach, idx, -1).to(torch.int32)
++            if shadow and lc >= 8192 and lc & (lc - 1) == 0:
++                logger.info(f"DSV41 prefill decisions exact: layer={layer.layer_id}, keys={lc}, queries={tok.numel()}")
+             if masks is not None:
+-                publish.append(torch.cat(masks) if len(masks) > 1 else masks[0])
++                publish.append(masks)
+         if publish is not None:
+             self.candidate_masks = publish
+ 
+@@ -3656,6 +3741,14 @@
+             and not forward_batch.forward_mode.is_idle()
+         ):
+             window.commit(self.token_to_kv_pool._swa_local_layer_id(layer.layer_id))
++        if (
++            not self.is_dspark_draft
++            and layer.layer_id + 1 == self.model_runner.model_config.hf_text_config.num_hidden_layers
++            and (forward_batch.forward_mode.is_decode() or forward_batch.forward_mode.is_target_verify())
++        ):
++            # Attention has consumed the last selection. MLP/logits do not use it.
++            self.forward_metadata._host_kv_staged = None
++            self.candidate_masks = None
+         return result
+ 
+     def _forward_attention(
+@@ -3734,6 +3827,35 @@
+             swa_topk_lengths = match_num_queries(swa_topk_lengths, value=1)
+             extra_indices = match_num_queries(extra_indices, value=-1)
+             extra_topk_lengths = match_num_queries(extra_topk_lengths, value=1)
++
++            # The source indexer publishes one selection reused by the following
++            # attention layers. Keep that packed selection on GPU until the next
++            # source indexer; the full conversation KV stays in host memory.
++            main_pool = (
++                token_to_kv_pool.layer_mapping[layer_id].compress_kv_pool
++                if compress_ratio in (1, 2) else None
++            )
++            if (
++                main_pool is not None
++                and getattr(main_pool, "is_host_mapped", False)
++                and not forward_batch.forward_mode.is_extend_without_speculative()
++                and extra_indices is not None and extra_indices.numel() > 0
++            ):
++                from sglang.srt.mem_cache.host_kv_staging import gather_packed_rows
++                sources = self.model_runner.model_config.hf_text_config.index_source_layer_ids
++                group = max(src for src in sources if src <= layer_id)
++                cached = getattr(metadata, "_host_kv_staged", None)
++                if layer_id in sources or cached is None or cached[0] != group:
++                    packed, local_indices = gather_packed_rows(
++                        token_to_kv_pool.get_extra_key_buffer(layer_id),
++                        extra_indices.contiguous(), extra_page_size,
++                    )
++                    cached = (group, packed, local_indices)
++                    metadata._host_kv_staged = cached
++                _, packed, extra_indices = cached
++                extra_k_cache = packed[:, :extra_page_size * k_cache_total_dim].view(
++                    packed.shape[0], extra_page_size, 1, k_cache_total_dim
++                )
+ 
+             if q.ndim == 3:
+                 q = q.unsqueeze(1)
+@@ -3883,6 +4005,7 @@
+         extra_k_cache = None
+         extra_page_size = None
+         flat_token_ids = None
++        selected_swa_ids = cache.swa_token_ids
+         if compress_ratio == 0:
+             workspace = self.sparse_prefill_workspace.get(cache.swa_token_ids.shape[0])
+             combined_indices = cache.c0_combined_indices
+@@ -3911,9 +4034,36 @@
+                 combined_indices, combined_lens = cache.combine_compressed(
+                     compress_ratio, raw_indices[: cache.num_qo_tokens]
+                 )
++            if (
++                compress_ratio in (1, 2) and q_flat.shape[0] > 128
++                and not torch.cuda.is_current_stream_capturing()
++            ):
++                # Each query keeps its original ordered keys, sink and scale.
++                # Project queries at full batch size, then bound only the
++                # dequantized attention workspace (at most64*512 main rows).
++                # Keep one final output and at most64 queries of scratch.
++                # Each copy preserves BF16 bits and finishes on the same stream
++                # before its temporary allocation can be reused.
++                output = q_flat.new_empty((*q_flat.shape[:-1], self.head_dim_v))
++                for first in range(0, q_flat.shape[0], 64):
++                    last = min(first + 64, q_flat.shape[0])
++                    piece = _dsv41_sparse_prefill_piece(
++                        self, q_flat[first:last], flat_token_ids, cache.swa_token_ids,
++                        combined_indices[first:last], combined_lens[first:last],
++                        extra_k_cache, extra_page_size,
++                        token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
++                        cache.swa_page_size, attn_sink,
++                    )
++                    output[first:last].copy_(piece)
++                    del piece
++                return output
++            if compress_ratio in (1, 2):
++                flat_token_ids, selected_swa_ids, combined_indices = compact_prefill_gather(
++                    flat_token_ids, cache.swa_token_ids, combined_indices
++                )
+             n_compressed = flat_token_ids.shape[0]
+             workspace = self.sparse_prefill_workspace.get(
+-                n_compressed + cache.swa_token_ids.shape[0]
++                n_compressed + selected_swa_ids.shape[0]
+             )
+             compressed_slice = workspace[:n_compressed]
+             swa_slice = workspace[n_compressed:]
+@@ -3927,7 +4077,7 @@
+             )
+         dequantize_k_cache_paged(
+             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+-            cache.swa_token_ids,
++            selected_swa_ids,
+             page_size=cache.swa_page_size,
+             out=swa_slice,
+         )
+@@ -3942,6 +4092,12 @@
+             attn_sink=attn_sink,
+             topk_length=combined_lens,
+         )
++        # The dequantized KV scratch is fully overwritten on the next call.
++        # Keep it out of the following MoE workspace peak. Local views retain
++        # it until this function returns; CUDA stream ordering protects queued
++        # attention reads. Captured graphs retain their stable backing buffer.
++        if not torch.cuda.is_current_stream_capturing():
++            self.sparse_prefill_workspace._buffer = None
+         return o
+ 
+     def _prepare_q8kv8_q_and_sink(
+@@ -4474,3 +4630,27 @@
+             ],
+             dim=0,
+         )
++
++from sglang.srt.distributed.parallel_state import get_tp_group
++
++
++def _dsv41_sparse_prefill_piece(
++    backend, q, main_ids, swa_ids, indices, lengths,
++    main_cache, main_page, swa_cache, swa_page, sink,
++):
++    from sgl_kernel.flash_mla import flash_mla_sparse_fwd
++
++    main_ids, swa_ids, indices = compact_prefill_gather(main_ids, swa_ids, indices)
++    n_main = main_ids.shape[0]
++    workspace = backend.sparse_prefill_workspace.get(n_main + swa_ids.shape[0])
++    dequantize_k_cache_paged(main_cache, main_ids, page_size=main_page,
++                           out=workspace[:n_main])
++    dequantize_k_cache_paged(swa_cache, swa_ids, page_size=swa_page,
++                           out=workspace[n_main:])
++    out, _, _ = flash_mla_sparse_fwd(
++        q=q, kv=workspace, indices=indices.unsqueeze(1),
++        sm_scale=backend.softmax_scale, d_v=backend.head_dim_v,
++        attn_sink=sink, topk_length=lengths,
++    )
++    backend.sparse_prefill_workspace._buffer = None
++    return out
+--- /dev/null
++++ b/python/sglang/srt/layers/attention/dsv4/compact_prefill_gather.py
+@@ -0,0 +1,17 @@
++"""Compact the storage backing sparse prefill without changing key order."""
++import torch
++
++
++def compact_prefill_gather(compressed_ids, swa_ids, indices):
++    count = compressed_ids.numel()
++    if count == 0:
++        return compressed_ids, swa_ids, indices
++    unique, inverse = torch.unique(indices.reshape(-1), sorted=True, return_inverse=True)
++    # Negative indices retain an unused dummy entry in the compact store.
++    # Sorted unique indices put compressed entries before SWA entries, matching
++    # the order in which the caller fills the compact workspace.
++    compressed_columns = unique[unique < count].clamp_min(0).long()
++    swa_columns = (unique[unique >= count] - count).long()
++    remapped = inverse.reshape(indices.shape).to(indices.dtype)
++    remapped = torch.where(indices >= 0, remapped, indices)
++    return compressed_ids[compressed_columns], swa_ids[swa_columns], remapped
+--- a/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py
++++ b/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py
+@@ -283,5 +283,9 @@
+         """q [t, H, d], k [n, d], weights [t, H] -> [t, n], summed over all heads;
+         bf16 up to the reduction, as the reference does."""
+         s = torch.einsum("bhd,nd->bhn", q, k)
+-        s = (s.relu() * weights.unsqueeze(-1)).sum(dim=1)
++        # Inference-only private score tensor; preserve BF16 rounding while
++        # avoiding two additional score-sized allocations.
++        s.relu_()
++        s.mul_(weights.unsqueeze(-1))
++        s = s.sum(dim=1)
+         return s.float()
+--- a/python/sglang/srt/layers/attention/dsv4/indexer.py
++++ b/python/sglang/srt/layers/attention/dsv4/indexer.py
+@@ -1140,8 +1140,17 @@
+     in logits, so an all -inf block means not reachable yet; the block holding the
+     query's newest position is always kept."""
+     width = logits.size(-1)
+-    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
+-    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
++    # Full blocks are already contiguous views. Reduce the final partial
++    # block separately instead of copying the whole logits matrix for padding.
++    full_width = width // block_size * block_size
++    if full_width == width:
++        scores = logits.unflatten(-1, (-1, block_size)).amax(dim=-1)
++    elif full_width == 0:
++        scores = logits.amax(dim=-1, keepdim=True)
++    else:
++        complete = logits[..., :full_width].unflatten(-1, (-1, block_size)).amax(dim=-1)
++        tail = logits[..., full_width:].amax(dim=-1, keepdim=True)
++        scores = torch.cat((complete, tail), dim=-1)
+     num_blocks = scores.size(-1)
+ 
+     last = (compress_lens - 1) // block_size
+--- a/python/sglang/srt/layers/communicator.py
++++ b/python/sglang/srt/layers/communicator.py
+@@ -185,7 +185,8 @@
+ 
+ # TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
+ # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
+-FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
++# This task uses 256-token prefill chunks and one decoding request.
++FUSE_ALLREDUCE_MAX_BATCH_SIZE = 256
+ 
+ 
+ def apply_flashinfer_allreduce_fusion(batch_size: int):
+--- /dev/null
++++ b/python/sglang/srt/layers/mapped_input_embedding.py
+@@ -0,0 +1,23 @@
++"""Place an untied input lookup table in pinned host memory without recoding it."""
++import logging
++import torch
++from sglang.srt.mem_cache.mapped_host_kv import HostKVAllocation
++
++logger = logging.getLogger(__name__)
++
++
++def offload_input_embedding(model):
++    if getattr(model, '_mapped_input_embedding', None) is not None:
++        return
++    assert not model.config.tie_word_embeddings
++    parameter = model.model.embed_tokens.weight
++    assert parameter is not model.lm_head.weight
++    assert parameter.is_cuda and parameter.dtype in (torch.bfloat16, torch.float16)
++    allocation = HostKVAllocation(parameter.shape, dtype=parameter.dtype,
++                                  device=parameter.device)
++    allocation.host.copy_(parameter.detach(), non_blocking=False)
++    # Preserve the Parameter object and its loader/sharding attributes.
++    parameter.data = allocation.cuda
++    model._mapped_input_embedding = allocation
++    logger.info('Mapped input embedding: %.2f MiB in host RAM',
++                allocation.host.numel() * allocation.host.element_size() / 2**20)
+--- /dev/null
++++ b/python/sglang/srt/layers/mapped_vision_mlp.py
+@@ -0,0 +1,31 @@
++"""Construct image MLP weights in host RAM before GPU allocations fragment."""
++import logging
++import torch
++from sglang.srt.mem_cache.mapped_host_kv import HostKVAllocation
++
++
++def make_mapped_linear(in_features, out_features):
++    with torch.device('cpu'):
++        linear = torch.nn.Linear(in_features, out_features, bias=False)
++    assert linear.weight.dtype == torch.bfloat16
++    allocation = HostKVAllocation(linear.weight.shape, dtype=linear.weight.dtype,
++                                  device=torch.device('cuda', torch.cuda.current_device()))
++    # Native default_weight_loader later copies the real checkpoint into this
++    # CUDA-addressable host allocation. Preserve Parameter identity/attributes.
++    linear.weight.data = allocation.cuda
++    linear._mapped_vision_weight = allocation
++    return linear
++
++
++def offload_vision_mlp(model):
++    allocations = []
++    for block in model.vision.blocks:
++        for linear in (block.mlp.w1, block.mlp.w2):
++            allocation = linear._mapped_vision_weight
++            assert linear.weight.data_ptr() == allocation.cuda.data_ptr()
++            allocations.append(allocation)
++    model._mapped_vision_mlp = allocations
++    logging.getLogger(__name__).info(
++        'Direct host vision MLP: %.2f MiB (%d matrices)',
++        sum(a.host.numel()*a.host.element_size() for a in allocations)/2**20,
++        len(allocations))
+--- a/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
++++ b/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
+@@ -409,7 +409,7 @@
+     with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+         out = torch.empty(x.shape[0], out_hidden, dtype=output_dtype, device=x.device)
+ 
+-    flashinfer_cutlass_fused_moe(
++    _dsv41_prefill_moe(flashinfer_cutlass_fused_moe,
+         input=x,
+         token_selected_experts=topk_ids.to(torch.int32),
+         token_final_scales=topk_weights,
+@@ -444,3 +444,5 @@
+         out = out[:, :origin_hidden].contiguous()
+ 
+     return StandardCombineInput(hidden_states=out)
++
++from sglang.srt.layers.moe.moe_runner.prefill_moe_chunk import run as _dsv41_prefill_moe
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/moe_runner/prefill_moe_chunk.py
+@@ -0,0 +1,31 @@
++"""Bound only eager W4A16 expert workspace; retain routed IDs, scales and outputs."""
++import os
++import torch
++
++
++def run(function, **kwargs):
++    x = kwargs['input']
++    limit = int(os.environ.get('DSV41_EXPERT_PREFILL_CHUNK', '0'))
++    eligible = (
++        limit > 0 and x.shape[0] > limit
++        and x.dtype == torch.bfloat16
++        and kwargs.get('input_sf') is None
++        and kwargs.get('use_w4_group_scaling', False)
++        and not kwargs.get('use_mxfp8_act_scaling', False)
++        and not kwargs.get('use_wfp4afp8_humming', False)
++        and not kwargs.get('enable_alltoall', False)
++        and not torch.cuda.is_current_stream_capturing()
++    )
++    if not eligible:
++        return function(**kwargs)
++    out = kwargs['output']
++    assert out.shape[0] == x.shape[0]
++    for first in range(0, x.shape[0], limit):
++        last = min(first + limit, x.shape[0])
++        part = dict(kwargs)
++        for key in ('input', 'token_selected_experts', 'token_final_scales', 'output'):
++            part[key] = kwargs[key][first:last]
++        part['tune_max_num_tokens'] = 1 << (last - first - 1).bit_length()
++        function(**part)
++    # The MXFP4 caller supplies the output buffer and ignores the return value.
++    return None
+--- a/python/sglang/srt/mem_cache/allocation.py
++++ b/python/sglang/srt/mem_cache/allocation.py
+@@ -180,10 +180,24 @@
+     extend_num_tokens: int,
+     req_pool_indices: Optional[torch.Tensor] = None,
+     batch=None,
++    exact_page_budget: bool = False,
+ ):
+-    # Over estimate the number of tokens: assume each request needs a new page.
+     allocator = tree_cache.token_to_kv_pool_allocator
+-    num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
++    if exact_page_budget:
++        # Use the same page count as the paged allocator. A speculative step
++        # can fill a partial existing page or extend already aligned endpoints;
++        # adding another page per row evicts prefixes unnecessarily.
++        assert prefix_lens_cpu.device.type == seq_lens_cpu.device.type == "cpu"
++        assert bool(torch.all(seq_lens_cpu >= prefix_lens_cpu))
++        assert int((seq_lens_cpu - prefix_lens_cpu).sum()) == extend_num_tokens
++        from sglang.srt.utils.common import get_num_new_pages
++        num_tokens = get_num_new_pages(
++            seq_lens=seq_lens_cpu, page_size=allocator.page_size,
++            prefix_lens=prefix_lens_cpu,
++        ) * allocator.page_size
++    else:
++        # Preserve the existing conservative budget for ordinary prefill.
++        num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
+     evict_from_tree_cache(tree_cache, num_tokens)
+ 
+     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c128_attn_allocator")
+@@ -685,6 +699,11 @@
+             device_type = getattr(
+                 batch.device, "type", str(batch.device).split(":", 1)[0]
+             )
++            # This overlay is qualified only for CUDA. Other platforms keep
++            # their existing dispatch signatures and allocation budgets.
++            alloc_kwargs = (
++                {"exact_page_budget": True} if device_type == "cuda" and not _is_hip else {}
++            )
+             out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
+                 tree_cache,
+                 cur_kv_lens,
+@@ -695,6 +714,7 @@
+                 num_needed_tokens,
+                 req_pool_indices=req_pool_indices,
+                 batch=batch,
++                **alloc_kwargs,
+             )
+         # Updating req_to_token is a write to a shared tensor: it must not overlap
+         # with the previous batch's forward, which also reads req_to_token.
+--- a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
++++ b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import os
+ from contextlib import nullcontext
+ from typing import List, Literal, NamedTuple, Optional, Sequence, Tuple
+ 
+@@ -189,6 +190,24 @@
+ 
+     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+         raise NotImplementedError("Use get_key_buffer instead.")
++
++
++class MappedHostV41KVPool(DeepSeekV4SingleKVPool):
++    is_host_mapped = True
++
++    def create_buffer(self, *, num_pages):
++        from sglang.srt.mem_cache.mapped_host_kv import HostKVAllocation
++        self.kv_cache_total_dim = self.get_bytes_per_token()
++        assert self.kv_cache_total_dim == 584 and self.store_dtype == torch.uint8
++        self.bytes_per_page_padded = ceil_div(self.page_size * 584, 576) * 576
++        allocation = HostKVAllocation((num_pages, self.bytes_per_page_padded),
++                                      dtype=self.store_dtype, device=self.device)
++        if not hasattr(self, "host_allocations"):
++            self.host_allocations = []
++        self.host_allocations.append(allocation)
++        logger.info("V4.1 host KV allocation: pages=%d, bytes=%d, GPU=%s",
++                    num_pages, allocation.host.numel(), self.device)
++        return allocation.cuda
+ 
+ 
+ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
+@@ -770,6 +789,9 @@
+                 device=device,
+                 enable_memory_saver=enable_memory_saver,
+                 global_page_size=swa_page_size,
++                cls=(MappedHostV41KVPool if is_draft_worker and
++                     os.environ.get("DSV41_DRAFT_HOST_SWA") == "1"
++                     else DeepSeekV4SingleKVPool),
+             )
+ 
+         logger.info(
+@@ -1227,9 +1249,13 @@
+                     enable_memory_saver=enable_memory_saver,
+                     global_page_size=page_size,
+                     cls=(
+-                        HiSparseC4DevicePool
+-                        if ratio == 4 and enable_hisparse
+-                        else DeepSeekV4SingleKVPool
++                        MappedHostV41KVPool
++                        if ratio in (1, 2) and os.environ.get("DSV41_HOST_KV") == "1"
++                        else (
++                            HiSparseC4DevicePool
++                            if ratio == 4 and enable_hisparse
++                            else DeepSeekV4SingleKVPool
++                        )
+                     ),
+                 )
+ 
+--- /dev/null
++++ b/python/sglang/srt/mem_cache/host_kv_staging.py
+@@ -0,0 +1,37 @@
++"""Copy only selected packed KV rows to GPU memory, preserving byte order."""
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _gather_packed_rows(src,ids,dst,N:tl.constexpr,PAGE:tl.constexpr,
++                        SOURCE_STRIDE:tl.constexpr,DEST_STRIDE:tl.constexpr,
++                        WIDTH:tl.constexpr,BLOCK:tl.constexpr):
++    row=tl.program_id(0)
++    byte=tl.arange(0,BLOCK)
++    token=tl.load(ids+row).to(tl.int64)
++    # A page stores all 576-byte payloads, then all 8-byte scale records.
++    offset=(token//PAGE)*SOURCE_STRIDE+tl.where(
++        byte<576,(token%PAGE)*576+byte,PAGE*576+(token%PAGE)*8+byte-576)
++    target=(row//PAGE)*DEST_STRIDE+tl.where(
++        byte<576,(row%PAGE)*576+byte,PAGE*576+(row%PAGE)*8+byte-576)
++    value=tl.load(src+offset,mask=(byte<WIDTH)&(token>=0),other=0)
++    tl.store(dst+target,value,mask=byte<WIDTH)
++
++
++def gather_packed_rows(source,indices,page_size,out=None):
++    assert source.ndim==2
++    original_dtype=source.dtype
++    source=source.view(torch.uint8)
++    assert indices.is_contiguous()
++    n=indices.numel()
++    row_bytes=triton.cdiv(page_size*584,576)*576
++    if out is None:
++        out=torch.empty((triton.cdiv(n,page_size),row_bytes),device=indices.device,dtype=torch.uint8)
++    else:
++        out=out.view(torch.uint8)
++    _gather_packed_rows[(n,)](source,indices,out,n,page_size,source.stride(0),out.stride(0),584,1024)
++    local=torch.arange(n,dtype=torch.int32,device=indices.device).view_as(indices)
++    local=torch.where(indices>=0,local,-1)
++    return out.view(original_dtype),local
+--- /dev/null
++++ b/python/sglang/srt/mem_cache/mapped_host_kv.py
+@@ -0,0 +1,26 @@
++"""Task-scoped host KV storage with a non-owning CUDA tensor view.
++
++The pool must retain HostKVAllocation while its CUDA view or captured graphs are
++in use. Data stays in pinned host RAM; constructing this view does not copy it.
++"""
++import math
++import torch
++from cuda.bindings import runtime as cudart
++
++
++class HostKVAllocation:
++    def __init__(self, shape, *, dtype=torch.uint8, device=None):
++        requested=torch.device(device) if device is not None else torch.device('cuda')
++        assert requested.type=='cuda'
++        self.device=torch.device('cuda',requested.index if requested.index is not None else torch.cuda.current_device())
++        self.host=torch.zeros(tuple(shape),dtype=dtype,device='cpu',pin_memory=True)
++        status,pointer=cudart.cudaHostGetDevicePointer(self.host.data_ptr(),0)
++        if status!=cudart.cudaError_t.cudaSuccess:
++            raise RuntimeError(f'cudaHostGetDevicePointer: {status}')
++        storage=torch._C._construct_storage_from_data_pointer(
++            int(pointer),self.device,self.host.numel()*self.host.element_size())
++        self.cuda=torch.empty(0,dtype=dtype,device=self.device).set_(
++            storage,0,tuple(shape))
++        # Retain the allocation even when a caller retains only this root view.
++        self.cuda._host_kv_owner=self.host
++        assert self.cuda.is_cuda and self.cuda.shape==self.host.shape
+--- a/python/sglang/srt/mem_cache/unified_cache/components/swa_component.py
++++ b/python/sglang/srt/mem_cache/unified_cache/components/swa_component.py
+@@ -115,6 +115,26 @@
+         covered_by_leaf = self._session_leaf_covered_len.setdefault(session_id, {})
+         assert leaf not in covered_by_leaf
+         target_span = self.sliding_window_size + self.tree_core.page_size
++        if session_id == "__dsv41_finished_cache__":
++            # The reference walker counts whole radix segments. Split its oldest
++            # covered segment so a short tail cannot retain a long prefill chunk.
++            page = self.tree_core.page_size
++            remaining = (target_span + page - 1) // page * page
++            node = leaf
++            while node is not self.tree_core.root_node and remaining > 0:
++                length = len(node.key)
++                if length > remaining:
++                    split_at = length - remaining
++                    if (
++                        split_at % page == 0
++                        and length % page == 0
++                        and node.write_through_pending_id is None
++                    ):
++                        _, action = self.tree_core._split_node(node.key, node, split_at)
++                        assert action is None
++                    break
++                remaining -= length
++                node = node.parent
+         covered = self._walk_session_coverage(leaf, target_span, 1)
+         assert covered > 0
+         covered_by_leaf[leaf] = covered
+--- a/python/sglang/srt/mem_cache/unified_radix_cache.py
++++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
+@@ -2,6 +2,7 @@
+ 
+ import atexit
+ import logging
++import os
+ import threading
+ import time
+ from dataclasses import replace
+@@ -934,6 +935,14 @@
+             if req.finished_reason is not None and not isinstance(
+                 req.finished_reason, FINISH_ABORT
+             ):
++                if (
++                    os.environ.get("DSV41_PREFER_FINISHED_CACHE") == "1"
++                    and req.session_id is None and req.session is None
++                ):
++                    # Soft cache references only: this does not join, append, or
++                    # reconstruct prompts. Exact prefix keys remain unchanged.
++                    req.session_id = "__dsv41_finished_cache__"
++                    req.session_generation = self.ensure_session_generation(req.session_id)
+                 self.session_refs.register_session_ref(req)
+ 
+     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
+--- a/python/sglang/srt/model_executor/pool_configurator.py
++++ b/python/sglang/srt/model_executor/pool_configurator.py
+@@ -14,6 +14,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import os
+ from bisect import bisect_right
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Optional
+@@ -930,7 +931,7 @@
+             self.indexer_head_dim, use_fp4_indexer=True
+         )
+         self.low_ratio_bytes_per_full_token = sum(
+-            (self.kv_bytes + low_ratio_index_bytes) / cfg.compress_ratios[l]
++            ((0 if os.environ.get("DSV41_HOST_KV") == "1" else self.kv_bytes) + low_ratio_index_bytes) / cfg.compress_ratios[l]
+             for l in cfg.hf_config.kv_source_layer_ids
+             if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
+             and cfg.compress_ratios[l] in (1, 2)
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -935,7 +935,7 @@
+         )
+         freqs_cis = precompute_freqs_cis(
+             dim=self.qk_rope_head_dim,
+-            seqlen=config.max_position_embeddings,
++            seqlen=_dsv41_rope_table_length(config),
+             original_seq_len=original_seq_len,
+             base=self.rope_base,
+             factor=scaling.get("factor", 1.0),
+@@ -1022,6 +1022,12 @@
+             is_neox_style=False,
+             device=get_device().device,
+         )
++        table_length = _dsv41_rope_table_length(config)
++        if self.rotary_emb.cos_sin_cache.shape[0] > table_length:
++            # The wrapper retains its original frequency/scaling configuration.
++            # Clone the prefix so the unused storage can actually be released.
++            self.rotary_emb.cos_sin_cache = self.rotary_emb.cos_sin_cache[:table_length].clone()
++        _dsv41_maybe_map_rope_wrapper(self.rotary_emb)
+ 
+         if _is_npu:
+             Dsv4NpuRoPE.for_freqs(
+@@ -5038,6 +5044,13 @@
+                 if getattr(layer, "engram", None) is not None:
+                     layer.engram.embed.finish_load(label=f"layer {i}")
+             self._prewarm_mhc_kernels()
++            if _dsv41_host_input_embedding_enabled():
++                from sglang.srt.layers.mapped_input_embedding import offload_input_embedding
++                offload_input_embedding(self)
++            import os
++            if os.environ.get("DSV41_HOST_VISION_MLP") == "1":
++                from sglang.srt.layers.mapped_vision_mlp import offload_vision_mlp
++                offload_vision_mlp(self)
+ 
+     def get_embed_and_head(self):
+         return self.model.embed_tokens.weight, self.lm_head.weight
+@@ -5186,3 +5199,32 @@
+             )
+         return q
+     return torch.cat([q, kv], dim=0)
++
++
++def _dsv41_rope_table_length(config):
++    import os
++    if os.environ.get("DSV41_TRIM_ROPE_TABLES") != "1":
++        return config.max_position_embeddings
++    from sglang.srt.runtime_context import get_context
++    context = get_context().resolved_server_args_dict().get("context_length")
++    if context is None:
++        return config.max_position_embeddings
++    assert int(context) > 0
++    return min(config.max_position_embeddings, int(context) + 256)
++
++
++def _dsv41_maybe_map_rope_wrapper(wrapper):
++    import os
++    if os.environ.get("DSV41_HOST_ROPE") != "1" or hasattr(wrapper, "_mapped_rope_cache"):
++        return
++    from sglang.srt.mem_cache.mapped_host_kv import HostKVAllocation
++    cache = wrapper.cos_sin_cache
++    allocation = HostKVAllocation(cache.shape, dtype=cache.dtype, device=cache.device)
++    allocation.host.copy_(cache, non_blocking=False)
++    wrapper.cos_sin_cache = allocation.cuda
++    wrapper._mapped_rope_cache = allocation
++
++
++def _dsv41_host_input_embedding_enabled():
++    import os
++    return os.environ.get("DSV41_HOST_INPUT_EMBEDDING") == "1"
+--- a/python/sglang/srt/models/deepseek_v41_vit.py
++++ b/python/sglang/srt/models/deepseek_v41_vit.py
+@@ -90,11 +90,22 @@
+ class MLP(nn.Module):
+     def __init__(self, args):
+         super().__init__()
+-        self.w1 = nn.Linear(args.vision_dim, 2 * args.vision_inter_dim, bias=False)
+-        self.w2 = nn.Linear(args.vision_inter_dim, args.vision_dim, bias=False)
++        import os
++        if os.environ.get("DSV41_HOST_VISION_MLP") == "1":
++            from sglang.srt.layers.mapped_vision_mlp import make_mapped_linear
++            self.w1 = make_mapped_linear(args.vision_dim, 2 * args.vision_inter_dim)
++            self.w2 = make_mapped_linear(args.vision_inter_dim, args.vision_dim)
++        else:
++            self.w1 = nn.Linear(args.vision_dim, 2 * args.vision_inter_dim, bias=False)
++            self.w2 = nn.Linear(args.vision_inter_dim, args.vision_dim, bias=False)
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+-        gate, up = self.w1(x).chunk(2, dim=-1)
++        projected = self.w1(x)
++        import os
++        if os.environ.get("DSV41_VISION_ACTIVATION_REUSE") == "1":
++            from sglang.srt.models.vision_activation_reuse import swiglu
++            return self.w2(swiglu(projected))
++        gate, up = projected.chunk(2, dim=-1)
+         return self.w2(F.silu(gate) * up)
+ 
+ 
+--- /dev/null
++++ b/python/sglang/srt/models/vision_activation_reuse.py
+@@ -0,0 +1,25 @@
++"""Compact a vision SwiGLU result into already-consumed projection storage."""
++import torch
++import torch.nn.functional as F
++
++
++def swiglu(projected):
++    if torch.is_grad_enabled() or torch.is_autocast_enabled() or not projected.is_contiguous():
++        gate, up = projected.chunk(2, dim=-1)
++        return F.silu(gate) * up
++    width = projected.shape[-1] // 2
++    source = projected.view(-1, width * 2)
++    rows = source.shape[0]
++    packed = projected.view(-1)[:rows * width].view(rows, width)
++    first = 0
++    while first < rows:
++        # Output rows [first,last) overwrite source rows below first. The
++        # initial row is safe after SiLU has read its gate; later blocks obey
++        # last <= 2*first, so no unread source row can be overwritten.
++        count = 1 if first == 0 else min(first, 512)
++        last = min(rows, first + count)
++        activated = F.silu(source[first:last, :width])
++        torch.mul(activated, source[first:last, width:], out=packed[first:last])
++        del activated
++        first = last
++    return packed.view(*projected.shape[:-1], width)
